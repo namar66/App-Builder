@@ -35,7 +35,7 @@ The project consists of two main components:
 
 **On your Host System (Fedora Kinoite/Silverblue):**
 ```bash
-rpm-ostree install python3-pyqt6 erofs-utils bubblewrap
+rpm-ostree install python3-pyqt6 erofs-utils
 ```
 or use sysext for install deps
 
