@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Host-Native App Installer
+Comment=Build standalone apps via toolbox
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=org.kde.hostnative
+X-Plasma-DBusRunner-Path=/runner
+X-Plasma-Request-Actions-Once=true
+X-Plasma-Runner-Min-Letter-Count=3
+X-Plasma-Runner-Syntaxes=install :q:,build :q:
+X-Plasma-Runner-Syntax-Descriptions=Builds and installs an application
+Type=Service
+Icon=system-software-install
