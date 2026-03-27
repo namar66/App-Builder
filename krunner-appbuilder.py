@@ -82,7 +82,7 @@ class AppBuilderRunner(dbus.service.Object):
         ])
 
         # IMPORTANT: Change this to the absolute path where your builder script lives
-        builder_script = "/var/home/martin/development/appimage/appimage-builder.py"
+        builder_script = "$HOME/.local/bin/appimage-builder.py"
         
         # Execute via toolbox
         cmd = ["toolbox", "run", "-c", "sysext-builder", builder_script, app_name, app_name]
