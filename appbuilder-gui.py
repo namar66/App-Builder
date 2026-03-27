@@ -1,446 +1,463 @@
 #!/usr/bin/env python3
 
-# Modern Host-Only App Manager (Host GUI)
-# Runs on the host system but executes DNF and Builder inside a toolbox.
+# Modern Host-Only App Builder
+# Generates a standalone executable, extracts native icons, and creates menu entries.
+# Requires: gcc, mkfs.erofs, rpm, cpio, dnf
 
-import sys
 import os
+import sys
 import subprocess
+import shutil
 import logging
 import re
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QSplitter, QListWidget, QTableView,
-                             QLineEdit, QTabWidget, QTextEdit, QLabel, QPushButton,
-                             QHeaderView, QMenu, QMessageBox, QAbstractItemView)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QAction
+import struct
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# Configuration: Define which toolbox handles the building
-TOOLBOX_NAME = "devel"
+def run_cmd(cmd, cwd=None):
+    try:
+        return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True, errors="replace")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Command failed: {' '.join(cmd)}\nError: {e.stderr}")
+        sys.exit(1)
 
-# ==========================================
-# ASYNC BUILDER THREAD
-# ==========================================
-class AppBuildWorker(QThread):
-    output_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool, str)
+def calculate_host_dependencies(packages):
+    if not packages:
+        return []
+    logging.info("Calculating missing dependencies against host OS...")
+    cmd = ["flatpak-spawn", "--host", "rpm-ostree", "install", "--dry-run"] + packages
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        added_pkgs = []
+        parsing_added = False
+        nevra_re = re.compile(r'^(.+?)-(([0-9]+:)?([^-]+)-([^-]+))\.(x86_64|noarch|i686)$')
+        
+        for line in res.stdout.splitlines():
+            if any(line.startswith(s) for s in ["Installing ", "Added:", "Upgrading ", "Upgraded:"]):
+                parsing_added = True
+                continue
+            elif any(line.startswith(s) for s in ["Removing ", "Removed:"]):
+                parsing_added = False
+                continue
+            
+            if parsing_added and line.startswith(" "):
+                raw_pkg = line.strip().split()[0]
+                match = nevra_re.match(raw_pkg)
+                if match:
+                    name_pkg, arch = match.group(1), match.group(6)
+                    formatted = f"{name_pkg}.{arch}"
+                    if formatted not in added_pkgs:
+                        added_pkgs.append(formatted)
+        return added_pkgs
+    except:
+        return packages
 
-    def __init__(self, app_name, packages):
-        super().__init__()
-        self.app_name = app_name
-        self.packages = packages
+def fix_absolute_symlinks(staging_root):
+    logging.info("Fixing absolute symlinks for isolated execution...")
+    for root, dirs, files in os.walk(staging_root):
+        for name in files + dirs:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                target = os.readlink(path)
+                if target.startswith('/'):
+                    virtual_path = "/" + os.path.relpath(path, staging_root)
+                    virtual_dir = os.path.dirname(virtual_path)
+                    rel_target = os.path.relpath(target, virtual_dir)
+                    os.unlink(path)
+                    os.symlink(rel_target, path)
 
-    def run(self):
-        self.output_signal.emit(f"Delegating build for {self.app_name} to toolbox '{TOOLBOX_NAME}'...\n")
+def detect_entrypoint(staging_root, app_name):
+    desktop_exec = None
+    desktop_files = []
+    
+    for root, dirs, files in os.walk(staging_root):
+        for f in files:
+            if f.endswith(".desktop"):
+                desktop_files.append(os.path.join(root, f))
+                
+    desktop_files.sort(key=lambda x: 0 if app_name.lower() in os.path.basename(x).lower() else 1)
 
-        # We must provide the absolute path to the builder script so toolbox can find it.
-        builder_script = os.path.abspath("./appimage-builder.py")
-        if not os.path.exists(builder_script):
-            self.finished_signal.emit(False, f"Builder script not found at {builder_script}")
-            return
+    for df_path in desktop_files:
+        basename = os.path.basename(df_path).lower()
+        if app_name.lower() in basename or len(desktop_files) == 1:
+            with open(df_path, 'r', encoding='utf-8', errors='ignore') as df:
+                for line in df:
+                    if line.startswith("Exec="):
+                        cmd = line.strip().split("=", 1)[1]
+                        parts = cmd.split()
+                        for part in parts:
+                            if "=" not in part and part.lower() != "env":
+                                desktop_exec = os.path.basename(part)
+                                break
+                        if not desktop_exec and len(parts) > 0:
+                            desktop_exec = os.path.basename(parts[0])
+                        break
+        if desktop_exec:
+            break
+            
+    targets = []
+    if desktop_exec:
+        targets.append(desktop_exec)
+    targets.append(app_name)
 
-        # Execute inside toolbox
-        cmd = ["toolbox", "run", "-c", TOOLBOX_NAME, builder_script, self.app_name] + self.packages
+    search_dirs = ["usr/bin", "opt", "usr/libexec", "usr/sbin"]
+    for target in targets:
+        for sdir in search_dirs:
+            full_sdir = os.path.join(staging_root, sdir)
+            if os.path.exists(full_sdir):
+                for root, dirs, files in os.walk(full_sdir):
+                    if target in files:
+                        rel_path = os.path.relpath(os.path.join(root, target), staging_root)
+                        logging.info(f"Smart-detected entrypoint: /{rel_path}")
+                        return "/" + rel_path
+                        
+    logging.warning("Could not auto-detect entrypoint. Falling back to bash.")
+    return "/usr/bin/bash"
 
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in process.stdout:
-                self.output_signal.emit(line.strip())
-            process.wait()
+def generate_c_wrapper(source_path, entrypoint_suffix):
+    c_code = f"""
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <stdint.h>
+#include <string.h>
+#include <dirent.h>
 
-            if process.returncode != 0:
-                self.finished_signal.emit(False, f"Build failed with exit code {process.returncode}")
-                return
+typedef struct __attribute__((packed)) {{
+    uint64_t erofs_offset;
+    uint32_t magic; // 0x41505049 (APPI)
+}} app_footer_t;
 
-            self.finished_signal.emit(True, f"Successfully built and installed {self.app_name}!\nCheck your application menu.")
+int main(int argc, char *argv[]) {{
+    char self_path[4096];
+    ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (len == -1) return 1;
+    self_path[len] = '\\0';
 
-        except Exception as e:
-            self.finished_signal.emit(False, f"Critical error during build delegation: {e}")
+    int fd_self = open(self_path, O_RDONLY);
+    if (fd_self < 0) return 1;
 
+    struct stat st;
+    if (fstat(fd_self, &st) != 0) return 1;
 
-# ==========================================
-# ASYNC DNF WORKER THREAD
-# ==========================================
-class DnfAsyncWorker(QThread):
-    packages_loaded = pyqtSignal(list)
-    groups_loaded = pyqtSignal(list)
-    group_details_loaded = pyqtSignal(list)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
+    app_footer_t footer;
+    if (lseek(fd_self, st.st_size - sizeof(app_footer_t), SEEK_SET) == -1) return 1;
+    if (read(fd_self, &footer, sizeof(app_footer_t)) != sizeof(app_footer_t)) return 1;
 
-    def __init__(self, task="available", group_name=None):
-        super().__init__()
-        self.task = task
-        self.group_name = group_name
+    if (footer.magic != 0x41505049) {{
+        fprintf(stderr, "Error: Magic number mismatch.\\n");
+        return 1;
+    }}
+    close(fd_self);
 
-    def load_groups(self):
-        logging.info(f"[WORKER] Fetching DNF groups from toolbox {TOOLBOX_NAME}...")
-        cmd = ["toolbox", "run", "-c", TOOLBOX_NAME, "dnf", "group", "list", "--hidden"]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                self.error.emit(f"DNF Group List Error: {res.stderr.strip()}")
-                return
+    char mount_point[] = "/tmp/appmnt.XXXXXX";
+    if (mkdtemp(mount_point) == NULL) return 1;
 
-            groups = []
-            for line in res.stdout.splitlines():
-                clean_line = line.strip()
-                if not clean_line or clean_line.startswith((
-                    "ID", "Available", "Installed", "Hidden", "Environment",
-                    "Last metadata", "Aktualizace", "Repozitáře"
-                )):
+    char offset_str[64];
+    snprintf(offset_str, sizeof(offset_str), "--offset=%llu", (unsigned long long)footer.erofs_offset);
+
+    pid_t fuse_pid = fork();
+    if (fuse_pid == 0) {{
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null != -1) {{
+            dup2(dev_null, STDOUT_FILENO);
+            dup2(dev_null, STDERR_FILENO);
+            close(dev_null);
+        }}
+        char *fuse_args[] = {{"erofsfuse", offset_str, self_path, mount_point, NULL}};
+        execvp(fuse_args[0], fuse_args);
+        exit(1);
+    }}
+
+    usleep(250000);
+
+    pid_t app_pid = fork();
+    if (app_pid == 0) {{
+        char path_env[2048], ld_env[2048], xdg_env[2048], entrypoint_path[2048];
+        char opt_bind_src[2048], libgl_env[2048];
+        
+        snprintf(path_env, sizeof(path_env), "/app/usr/bin:/usr/bin:/bin");
+        snprintf(ld_env, sizeof(ld_env), "/app/usr/lib64:/app/usr/lib:/usr/lib64:/usr/lib");
+        snprintf(xdg_env, sizeof(xdg_env), "/app/usr/share:/usr/share");
+        snprintf(entrypoint_path, sizeof(entrypoint_path), "/app%s", "{entrypoint_suffix}");
+        snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
+        snprintf(libgl_env, sizeof(libgl_env), "/app/usr/lib64/dri:/app/usr/lib/dri:/usr/lib64/dri:/usr/lib/dri");
+
+        char *home = getenv("HOME");
+        if (!home) home = "/";
+
+        char *bwrap_args[8192];
+        int arg_idx = 0;
+        
+        bwrap_args[arg_idx++] = "bwrap";
+        
+        bwrap_args[arg_idx++] = "--ro-bind"; bwrap_args[arg_idx++] = "/usr"; bwrap_args[arg_idx++] = "/usr";
+        bwrap_args[arg_idx++] = "--ro-bind"; bwrap_args[arg_idx++] = "/etc"; bwrap_args[arg_idx++] = "/etc";
+        
+        // --- THE SSL ILLUSION FOR UBUNTU BINARIES (STEAM) ---
+        bwrap_args[arg_idx++] = "--tmpfs"; bwrap_args[arg_idx++] = "/etc/ssl";
+        bwrap_args[arg_idx++] = "--dir"; bwrap_args[arg_idx++] = "/etc/ssl/certs";
+        bwrap_args[arg_idx++] = "--symlink"; bwrap_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; bwrap_args[arg_idx++] = "/etc/ssl/certs/ca-certificates.crt";
+        bwrap_args[arg_idx++] = "--symlink"; bwrap_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; bwrap_args[arg_idx++] = "/etc/ssl/certs/ca-bundle.crt";
+
+        bwrap_args[arg_idx++] = "--dev-bind"; bwrap_args[arg_idx++] = "/dev"; bwrap_args[arg_idx++] = "/dev";
+        bwrap_args[arg_idx++] = "--proc"; bwrap_args[arg_idx++] = "/proc";
+        bwrap_args[arg_idx++] = "--ro-bind"; bwrap_args[arg_idx++] = "/sys"; bwrap_args[arg_idx++] = "/sys";
+        bwrap_args[arg_idx++] = "--bind"; bwrap_args[arg_idx++] = "/tmp"; bwrap_args[arg_idx++] = "/tmp";
+        bwrap_args[arg_idx++] = "--bind"; bwrap_args[arg_idx++] = "/run"; bwrap_args[arg_idx++] = "/run";
+        bwrap_args[arg_idx++] = "--bind"; bwrap_args[arg_idx++] = "/var"; bwrap_args[arg_idx++] = "/var";
+        bwrap_args[arg_idx++] = "--bind"; bwrap_args[arg_idx++] = home; bwrap_args[arg_idx++] = home;
+        
+        bwrap_args[arg_idx++] = "--bind-try"; bwrap_args[arg_idx++] = "/mnt"; bwrap_args[arg_idx++] = "/mnt";
+        bwrap_args[arg_idx++] = "--bind-try"; bwrap_args[arg_idx++] = "/media"; bwrap_args[arg_idx++] = "/media";
+
+        bwrap_args[arg_idx++] = "--symlink"; bwrap_args[arg_idx++] = "usr/bin"; bwrap_args[arg_idx++] = "/bin";
+        bwrap_args[arg_idx++] = "--symlink"; bwrap_args[arg_idx++] = "usr/sbin"; bwrap_args[arg_idx++] = "/sbin";
+        bwrap_args[arg_idx++] = "--symlink"; bwrap_args[arg_idx++] = "usr/lib64"; bwrap_args[arg_idx++] = "/lib64";
+        
+        bwrap_args[arg_idx++] = "--dir"; bwrap_args[arg_idx++] = "/lib";
+        DIR *dir = opendir("/usr/lib");
+        if (dir) {{
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {{
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+                if (strcmp(entry->d_name, "ld-linux.so.2") == 0) continue;
+                
+                char *target = malloc(4096);
+                snprintf(target, 4096, "usr/lib/%s", entry->d_name);
+                char *linkpath = malloc(4096);
+                snprintf(linkpath, 4096, "/lib/%s", entry->d_name);
+                
+                bwrap_args[arg_idx++] = "--symlink";
+                bwrap_args[arg_idx++] = target;
+                bwrap_args[arg_idx++] = linkpath;
+            }}
+            closedir(dir);
+        }}
+        
+        bwrap_args[arg_idx++] = "--symlink";
+        bwrap_args[arg_idx++] = "/app/usr/lib/ld-linux.so.2";
+        bwrap_args[arg_idx++] = "/lib/ld-linux.so.2";
+
+        bwrap_args[arg_idx++] = "--ro-bind";
+        bwrap_args[arg_idx++] = mount_point;
+        bwrap_args[arg_idx++] = "/app";
+        
+        bwrap_args[arg_idx++] = "--dir"; bwrap_args[arg_idx++] = "/opt";
+        bwrap_args[arg_idx++] = "--ro-bind-try";
+        bwrap_args[arg_idx++] = opt_bind_src;
+        bwrap_args[arg_idx++] = "/opt";
+        
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "PATH"; bwrap_args[arg_idx++] = path_env;
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "LD_LIBRARY_PATH"; bwrap_args[arg_idx++] = ld_env;
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "XDG_DATA_DIRS"; bwrap_args[arg_idx++] = xdg_env;
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "LIBGL_DRIVERS_PATH"; bwrap_args[arg_idx++] = libgl_env;
+        
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "SSL_CERT_DIR"; bwrap_args[arg_idx++] = "/etc/pki/tls/certs";
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "SSL_CERT_FILE"; bwrap_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt";
+        bwrap_args[arg_idx++] = "--setenv"; bwrap_args[arg_idx++] = "CURL_CA_BUNDLE"; bwrap_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt";
+        
+        bwrap_args[arg_idx++] = entrypoint_path;
+        
+        // --- SMART SANDBOX FIX FOR STEAM/CHROMIUM ---
+        // Prevent steamwebhelper (CEF) from trying to construct a nested sandbox
+        if (strstr(entrypoint_path, "steam") != NULL) {{
+            bwrap_args[arg_idx++] = "-no-cef-sandbox";
+        }}
+        
+        for (int i = 1; i < argc && arg_idx < 8190; i++) bwrap_args[arg_idx++] = argv[i];
+        bwrap_args[arg_idx] = NULL;
+
+        execvp(bwrap_args[0], bwrap_args);
+        exit(1);
+    }}
+
+    int status;
+    waitpid(app_pid, &status, 0);
+
+    pid_t umount_pid = fork();
+    if (umount_pid == 0) {{
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null != -1) {{
+            dup2(dev_null, STDOUT_FILENO);
+            dup2(dev_null, STDERR_FILENO);
+            close(dev_null);
+        }}
+        char *umount_args[] = {{"fusermount3", "-q", "-u", mount_point, NULL}};
+        execvp(umount_args[0], umount_args);
+        exit(1);
+    }}
+    
+    waitpid(umount_pid, NULL, 0);
+    rmdir(mount_point);
+
+    return WEXITSTATUS(status);
+}}
+"""
+    with open(source_path, "w") as f:
+        f.write(c_code)
+
+def stitch_app(output_app_path, runtime_path, erofs_path):
+    with open(output_app_path, "wb") as f_out:
+        with open(runtime_path, "rb") as f_runtime:
+            f_out.write(f_runtime.read())
+        erofs_offset = f_out.tell()
+        with open(erofs_path, "rb") as f_erofs:
+            f_out.write(f_erofs.read())
+        footer = struct.pack("<QI", erofs_offset, 0x41505049)
+        f_out.write(footer)
+    os.chmod(output_app_path, 0o755)
+
+def integrate_into_system(app_name, final_app_path, staging_root):
+    logging.info("Extracting native desktop integrations...")
+    home = os.path.expanduser("~")
+    bin_dir = os.path.join(home, ".local", "bin")
+    app_target_dir = os.path.join(home, ".local", "share", "applications")
+    icon_target_dir = os.path.join(home, ".local", "share", "icons", "hicolor", "scalable", "apps")
+    
+    os.makedirs(bin_dir, exist_ok=True)
+    os.makedirs(app_target_dir, exist_ok=True)
+    os.makedirs(icon_target_dir, exist_ok=True)
+    
+    target_bin = os.path.join(bin_dir, f"{app_name}.app")
+    shutil.move(final_app_path, target_bin)
+    
+    desktop_src = None
+    icon_name = app_name
+    
+    search_desktop_dirs = [
+        os.path.join(staging_root, "usr", "share", "applications"),
+        os.path.join(staging_root, "opt")
+    ]
+    
+    for sdir in search_desktop_dirs:
+        if os.path.exists(sdir):
+            for root, dirs, files in os.walk(sdir):
+                for f in files:
+                    if f.endswith(".desktop"):
+                        desktop_src = os.path.join(root, f)
+                        if app_name in f:
+                            break
+                if desktop_src: break
+        if desktop_src: break
+
+    if desktop_src:
+        with open(desktop_src, "r", encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        
+        target_desktop = os.path.join(app_target_dir, f"{app_name}.desktop")
+        with open(target_desktop, "w", encoding='utf-8') as f:
+            for line in lines:
+                if line.startswith("Exec="):
+                    f.write(f"Exec={target_bin} %U\n")
+                elif line.startswith("TryExec="):
                     continue
+                else:
+                    if line.startswith("Icon="):
+                        icon_name = line.split("=")[1].strip()
+                    f.write(line)
+    else:
+        logging.warning("No native .desktop file found. Creating a generic one.")
+        with open(os.path.join(app_target_dir, f"{app_name}.desktop"), "w") as f:
+            f.write(f"[Desktop Entry]\nName={app_name.capitalize()}\nExec={target_bin} %U\nIcon={icon_name}\nType=Application\n")
 
-                parts = re.split(r'\s{2,}', clean_line)
-                if len(parts) >= 3:
-                    groups.append([parts[0], "Group", parts[1], parts[2]])
-                elif len(parts) == 2:
-                    groups.append([parts[0], "Group", parts[1], "Unknown"])
+    icon_search_dirs = [
+        os.path.join(staging_root, "usr", "share", "icons"),
+        os.path.join(staging_root, "opt")
+    ]
+    
+    for idir in icon_search_dirs:
+        if os.path.exists(idir):
+            for root, dirs, files in os.walk(idir):
+                for file in files:
+                    if file.startswith(icon_name) and file.endswith((".png", ".svg")):
+                        shutil.copy(os.path.join(root, file), os.path.join(icon_target_dir, file))
+                    
+    try:
+        subprocess.run(["update-desktop-database", app_target_dir], capture_output=True)
+    except FileNotFoundError:
+        pass
+    
+    logging.info(f"Successfully integrated {app_name}. It is now available in your KDE menu.")
 
-            self.groups_loaded.emit(groups)
-        except Exception as e:
-            self.error.emit(f"Failed to load groups: {e}")
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: build-app.py <App-Name> <Package1> [Package2 ...]")
+        sys.exit(1)
+        
+    name = sys.argv[1]
+    requested_packages = sys.argv[2:]
 
-    def load_group_details(self):
-        logging.info(f"[WORKER] Fetching details for group: {self.group_name}")
-        host_installed = self.get_host_installed_packages()
-        cmd = ["toolbox", "run", "-c", TOOLBOX_NAME, "env", "LANG=C", "dnf", "group", "info", "--quiet", self.group_name]
+    output_dir = os.path.abspath("./")
+    build_dir = f"/var/tmp/app-build-{name}"
+    staging_root = os.path.join(build_dir, "root")
 
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            packages = []
-            parsing_target = False
+    try:
+        if os.path.exists(build_dir): shutil.rmtree(build_dir)
+        os.makedirs(staging_root, exist_ok=True)
 
-            for line in res.stdout.splitlines():
-                if not line.strip(): continue
-                if ":" in line:
-                    left_part, right_part = line.split(":", 1)
-                    left_clean = left_part.strip()
-                    right_clean = right_part.strip()
+        local_rpms = [p for p in requested_packages if p.endswith(".rpm") and os.path.isfile(p)]
+        repo_packages = [p for p in requested_packages if p not in local_rpms]
+        missing_deps = calculate_host_dependencies(repo_packages + local_rpms)
+        
+        dnf_dir = os.path.join(build_dir, "dnf-downloads")
+        os.makedirs(dnf_dir, exist_ok=True)
 
-                    if left_clean in ["Mandatory packages", "Default packages"]:
-                        parsing_target = True
-                        if right_clean and right_clean not in host_installed:
-                            packages.append(right_clean)
-                    elif left_clean == "":
-                        if parsing_target and right_clean and right_clean not in host_installed:
-                            packages.append(right_clean)
-                    else:
-                        parsing_target = False
-
-            self.group_details_loaded.emit(packages)
-        except Exception as e:
-            self.error.emit(f"Failed to load group details: {e}")
-
-    def get_host_installed_packages(self) -> set:
-        """Fetch RPMs natively from the host since the GUI is running on the host."""
-        try:
-            cmd = ["rpm", "-qa", "--queryformat", "%{NAME}\n"]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return set(res.stdout.splitlines())
-        except Exception as e:
-            logging.warning(f"Failed to fetch host packages: {e}")
-            return set()
-
-    def load_available_packages(self):
-        logging.info("[WORKER] Loading installed packages from host...")
-        host_installed = self.get_host_installed_packages()
-
-        cmd = ["toolbox", "run", "-c", TOOLBOX_NAME, "dnf", "repoquery", "--quiet", "--queryformat", "%{name}|%{version}-%{release}|%{repoid}\n"]
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            batch = []
-
+        if missing_deps:
+            logging.info(f"Will download {len(missing_deps)} missing packages:")
+            for dep in missing_deps:
+                print(f" -> {dep}", flush=True)
+                
+            logging.info("Starting live DNF download...")
+            
+            cmd_dnf = ["dnf", "--refresh", "download", "-y", f"--destdir={dnf_dir}"] + missing_deps
+            process = subprocess.Popen(cmd_dnf, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in process.stdout:
-                clean_line = line.strip()
-                if not clean_line or "Last metadata" in clean_line: continue
-
-                parts = clean_line.split("|")
-                if len(parts) == 3:
-                    name, version, repo = parts
-                    if name not in host_installed:
-                        batch.append([name, version, repo, "Available"])
-
-                if len(batch) >= 500:
-                    self.packages_loaded.emit(batch)
-                    batch = []
-
-            if batch:
-                self.packages_loaded.emit(batch)
+                print(line.strip(), flush=True)
             process.wait()
-
+            
             if process.returncode != 0:
-                self.error.emit(f"DNF failed with code {process.returncode}.")
+                logging.error("DNF download failed.")
+                sys.exit(1)
 
-        except Exception as e:
-            self.error.emit(f"Error reading from DNF: {e}")
+        rpms_to_extract = local_rpms + [os.path.join(dnf_dir, f) for f in os.listdir(dnf_dir) if f.endswith(".rpm")]
 
-    def run(self):
-        if self.task == "available":
-            self.load_available_packages()
-        elif self.task == "groups":
-            self.load_groups()
-        elif self.task == "group_details":
-            self.load_group_details()
-        self.finished.emit()
+        logging.info("Extracting RPMs...")
+        for rpm in rpms_to_extract:
+            ps = subprocess.Popen(["rpm2cpio", rpm], stdout=subprocess.PIPE)
+            subprocess.run(["cpio", "-idmv"], stdin=ps.stdout, cwd=staging_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ps.wait()
 
+        fix_absolute_symlinks(staging_root)
+        entrypoint_suffix = detect_entrypoint(staging_root, name)
 
-# ==========================================
-# MAIN GUI CLASS
-# ==========================================
-class AppManagerGUI(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle(f"Host-Only App Manager (Toolbox Backend: {TOOLBOX_NAME})")
-        self.resize(1100, 750)
+        erofs_payload = os.path.join(build_dir, "payload.erofs")
+        selinux_contexts = "/run/host/etc/selinux/targeted/contexts/files/file_contexts"
+        cmd_erofs = ["mkfs.erofs", "-x1", "--all-root", "-U", "clear", "-T", "0"]
+        if os.path.exists(selinux_contexts): cmd_erofs.append(f"--file-contexts={selinux_contexts}")
+        cmd_erofs.extend([erofs_payload, staging_root])
+        
+        logging.info("Building EROFS filesystem...")
+        run_cmd(cmd_erofs)
 
-        self.transaction_queue = []
-        self.worker = None
-        self.build_worker = None
+        c_source_path = os.path.join(build_dir, "wrapper.c")
+        runtime_bin_path = os.path.join(build_dir, "runtime")
+        generate_c_wrapper(c_source_path, entrypoint_suffix)
+        run_cmd(["gcc", "-O2", c_source_path, "-o", runtime_bin_path])
 
-        self.setup_ui()
+        final_app_path = os.path.join(output_dir, f"{name}.app")
+        stitch_app(final_app_path, runtime_bin_path, erofs_payload)
+        
+        integrate_into_system(name, final_app_path, staging_root)
 
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(main_splitter)
-
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.category_list = QListWidget()
-        self.category_list.addItems([
-            "📦 Available (DNF)",
-            "📁 Package Groups",
-            "🛒 Transaction Queue (0)"
-        ])
-        self.category_list.currentRowChanged.connect(self.on_category_changed)
-
-        left_layout.addWidget(QLabel("<b>Categories</b>"))
-        left_layout.addWidget(self.category_list)
-
-        self.btn_apply = QPushButton("Queue is empty (Right-click apps to add)")
-        self.btn_apply.setEnabled(False)
-        self.btn_apply.setStyleSheet("background-color: #7f8c8d; color: #ecf0f1; font-weight: bold; padding: 10px;")
-        self.btn_apply.clicked.connect(self.apply_transaction)
-        left_layout.addWidget(self.btn_apply)
-
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        top_right_panel = QWidget()
-        top_right_layout = QVBoxLayout(top_right_panel)
-        top_right_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.status_label = QLabel("Select a category to begin.")
-        self.status_label.setStyleSheet("color: gray; font-style: italic;")
-        top_right_layout.addWidget(self.status_label)
-
-        self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Live Search...")
-        top_right_layout.addWidget(self.search_bar)
-
-        self.package_table = QTableView()
-        self.package_model = QStandardItemModel(0, 4)
-        self.package_model.setHorizontalHeaderLabels(["Name", "Version", "Repository", "State"])
-
-        self.proxy_model = QSortFilterProxyModel()
-        self.proxy_model.setSourceModel(self.package_model)
-        self.proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy_model.setFilterKeyColumn(0)
-
-        self.package_table.setModel(self.proxy_model)
-        self.package_table.setSortingEnabled(True)
-        self.package_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.search_bar.textChanged.connect(self.proxy_model.setFilterFixedString)
-        self.package_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.package_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.package_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.package_table.customContextMenuRequested.connect(self.show_context_menu)
-
-        top_right_layout.addWidget(self.package_table)
-
-        self.details_tabs = QTabWidget()
-        self.tab_info = QTextEdit()
-        self.tab_info.setReadOnly(True)
-        self.details_tabs.addTab(self.tab_info, "Terminal / Information")
-
-        right_splitter.addWidget(top_right_panel)
-        right_splitter.addWidget(self.details_tabs)
-        right_splitter.setSizes([500, 200])
-
-        main_splitter.addWidget(left_panel)
-        main_splitter.addWidget(right_splitter)
-        main_splitter.setSizes([250, 850])
-        self.package_table.selectionModel().selectionChanged.connect(self.on_table_selection)
-
-    def on_category_changed(self, index):
-        self.package_model.removeRows(0, self.package_model.rowCount())
-        category = self.category_list.item(index).text()
-
-        if "Groups" in category:
-            self.package_model.setHorizontalHeaderLabels(["ID", "Type", "Name", "Installed"])
-            self.start_loading_groups()
-        elif "Queue" in category:
-            self.package_model.setHorizontalHeaderLabels(["Name", "Version", "Repository", "State"])
-            self.show_queue()
-        else:
-            self.package_model.setHorizontalHeaderLabels(["Name", "Version", "Repository", "State"])
-            self.start_loading_available()
-
-    def start_loading_available(self):
-        if getattr(self, 'worker', None) and self.worker.isRunning(): return
-        self.status_label.setText("⏳ Loading available packages via Toolbox...")
-        self.worker = DnfAsyncWorker(task="available")
-        self.worker.packages_loaded.connect(self.on_packages_batch_loaded)
-        self.worker.finished.connect(lambda: self.status_label.setText(f"✅ Loaded {self.package_model.rowCount()} packages."))
-        self.worker.error.connect(lambda e: self.status_label.setText(f"❌ Error: {e}"))
-        self.worker.start()
-
-    def on_packages_batch_loaded(self, batch):
-        for pkg in batch:
-            row = [QStandardItem(str(item)) for item in pkg]
-            self.package_model.appendRow(row)
-
-    def start_loading_groups(self):
-        if getattr(self, 'worker', None) and self.worker.isRunning(): return
-        self.status_label.setText("⏳ Loading Package Groups via Toolbox...")
-        self.worker = DnfAsyncWorker(task="groups")
-        self.worker.groups_loaded.connect(self.on_packages_batch_loaded)
-        self.worker.finished.connect(lambda: self.status_label.setText(f"✅ Loaded {self.package_model.rowCount()} groups."))
-        self.worker.error.connect(lambda e: self.status_label.setText(f"❌ Error: {e}"))
-        self.worker.start()
-
-    def on_table_selection(self, selected, deselected):
-        indexes = self.package_table.selectionModel().selectedRows()
-        if not indexes: return
-
-        real_index = self.proxy_model.mapToSource(indexes[0])
-        name = self.package_model.item(real_index.row(), 0).text()
-
-        if self.package_model.columnCount() > 1 and self.package_model.item(real_index.row(), 1):
-            item_type = self.package_model.item(real_index.row(), 1).text()
-            if item_type == "Group":
-                self.tab_info.setHtml(f"<h3>Loading contents for {name}...</h3>")
-                self.worker_details = DnfAsyncWorker(task="group_details", group_name=name)
-                self.worker_details.group_details_loaded.connect(self.on_group_details_loaded)
-                self.worker_details.start()
-                return
-
-        self.tab_info.setHtml(f"<h3>{name}</h3><p>Right-click to add this package to your build queue.</p>")
-
-    def on_group_details_loaded(self, packages):
-        html = f"<h3>Group Contents ({len(packages)} packages)</h3><ul>"
-        for p in packages: html += f"<li>{p}</li>"
-        html += "</ul><p><i><b>Right-click the group in the table</b> to add all these packages!</i></p>"
-        self.tab_info.setHtml(html)
-        self.current_group_packages = packages
-
-    def show_context_menu(self, position):
-        indexes = self.package_table.selectionModel().selectedRows()
-        if not indexes: return
-
-        menu = QMenu()
-        add_action = QAction("🛒 Add to Build Queue", self)
-        add_action.triggered.connect(lambda: self.add_selected_to_queue(indexes))
-        menu.addAction(add_action)
-        menu.exec(self.package_table.viewport().mapToGlobal(position))
-
-    def add_selected_to_queue(self, indexes):
-        for index in indexes:
-            real_index = self.proxy_model.mapToSource(index)
-            name = self.package_model.item(real_index.row(), 0).text()
-            item_type = self.package_model.item(real_index.row(), 1).text() if self.package_model.item(real_index.row(), 1) else ""
-
-            if item_type == "Group":
-                for pkg in getattr(self, 'current_group_packages', []):
-                    if pkg not in self.transaction_queue:
-                        self.transaction_queue.append(pkg)
-            else:
-                if name not in self.transaction_queue:
-                    self.transaction_queue.append(name)
-                    self.package_model.setItem(real_index.row(), 3, QStandardItem("Queued 🛒"))
-
-        self.update_queue_ui()
-
-    def update_queue_ui(self):
-        count = len(self.transaction_queue)
-        self.category_list.item(2).setText(f"🛒 Transaction Queue ({count})")
-
-        if count > 0:
-            self.btn_apply.setEnabled(True)
-            self.btn_apply.setText(f"Build App ({count} packages)")
-        else:
-            self.btn_apply.setEnabled(False)
-            self.btn_apply.setText("Queue is empty (Right-click apps to add)")
-            # Optional: Make it look disabled/grayed out
-            self.btn_apply.setStyleSheet("background-color: #7f8c8d; color: #bdc3c7; font-weight: bold; padding: 10px;")
-
-    def show_queue(self):
-        self.status_label.setText("Review your pending application build.")
-        for name in self.transaction_queue:
-            row = [
-                QStandardItem(name),
-                QStandardItem("pending"),
-                QStandardItem("queue"),
-                QStandardItem("To be built")
-            ]
-            self.package_model.appendRow(row)
-
-    def apply_transaction(self):
-        if not self.transaction_queue: return
-
-        primary_app = self.transaction_queue[0]
-
-        reply = QMessageBox.question(
-            self, 'Confirm Build',
-            f"Do you want to build '{primary_app}.app' using toolbox '{TOOLBOX_NAME}'?\n\nPackages: " + ", ".join(self.transaction_queue),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.btn_apply.setEnabled(False)
-            self.tab_info.clear()
-            self.status_label.setText(f"Building {primary_app} inside toolbox...")
-
-            self.build_worker = AppBuildWorker(primary_app, self.transaction_queue)
-            self.build_worker.output_signal.connect(self.append_terminal_output)
-            self.build_worker.finished_signal.connect(self.on_build_finished)
-            self.build_worker.start()
-
-    def append_terminal_output(self, text):
-        self.tab_info.append(text)
-        scrollbar = self.tab_info.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def on_build_finished(self, success, message):
-        self.btn_apply.setEnabled(True)
-        self.status_label.setText("Build finished.")
-
-        if success:
-            QMessageBox.information(self, "Success", message)
-            self.transaction_queue.clear()
-            self.update_queue_ui()
-            self.on_category_changed(self.category_list.currentRow())
-        else:
-            QMessageBox.critical(self, "Error", message)
-
-    def closeEvent(self, event):
-        try:
-            for worker in [self.worker, self.build_worker]:
-                if worker and worker.isRunning():
-                    worker.terminate()
-                    worker.wait(1000)
-        except Exception:
-            pass
-        finally:
-            event.accept()
+    finally:
+        if os.path.exists(build_dir):
+            shutil.rmtree(build_dir)
+            logging.info("Cleaned up build directory.")
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = AppManagerGUI()
-    window.show()
-    sys.exit(app.exec())
+    main()
