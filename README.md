@@ -1,64 +1,45 @@
-# Host-Native App Builder (for Atomic Fedora) (proof of concept)
+# Atomic AppImage Creator Pro
 
-A modern graphical package manager and build tool that creates blazing-fast, standalone `.app` executables using **EROFS** and **Bubblewrap**. 
+An unapologetically advanced, hyper-secure, and self-healing application packager and sandbox manager built specifically for Fedora Atomic desktops (Kinoite/Silverblue). 
 
-Designed specifically for immutable/atomic Linux distributions like **Fedora Kinoite** and **Silverblue**, it allows you to install GUI applications without overlaying your base system (`rpm-ostree`) or relying on legacy FUSE 2/SquashFS implementations used by traditional AppImages.
+Tired of bloated Flatpaks, dependency hell, and containers that either have too many permissions or break when you look at them funny? This tool builds ultra-slim, natively integrated `.app` executables powered by High-Performance EROFS compression and Bubblewrap.
 
-## 🚀 Why this exists?
+## 🚀 The Magic Inside
 
-Traditional AppImages are great, but they often struggle on modern atomic systems:
-1. They rely on outdated SquashFS and require `libfuse2` (which is often removed in modern distros like Fedora 43+).
-2. They bundle redundant libraries that your host system already has, wasting space.
-3. They don't easily integrate with native Wayland/GPU environments without tweaking.
+* **Smart Host-Native Routing:** Stop downloading half an operating system just to run a calculator. By interrogating `rpm-ostree`, this tool calculates exactly which shared libraries your host system already provides and bundles *only* the truly missing dependencies. Result? Apps that boot instantly and weigh megabytes, not gigabytes.
+* **32-Bit Multilib Sorcery:** Capable of running massive 32-bit legacy applications (like Steam and Proton) natively on a pure 64-bit atomic host. We achieve this via on-the-fly virtual `/lib` injection to perfectly bypass UsrMerge constraints without touching your host system.
+* **Anti-Flatkill Security Architecture:** We took the sandbox escape vectors (like compromised apps rewriting your `~/.bashrc` or `~/.ssh/` keys) and nuked them. Critical host shell configurations are hard-locked via `/dev/null` and strict `ro-binds` at the C-wrapper level. Even if you give an app full RW access to your home directory, it cannot infect your host shell.
+* **Self-Healing Build Environment:** Doesn't clutter your host. Automatically spins up and manages an isolated Podman `toolbox` for downloading and building packages. It seamlessly syncs your host's repositories and GPG keys (automatically handling Fedora's strict crypto-policies) to ensure every downloaded RPM is cryptographically verified.
+* **SELinux & EROFS Integration:** Bundles everything into a single, high-speed Read-Only File System (EROFS) executable while pulling native SELinux file contexts directly from the host to prevent silent AVC denial headaches.
 
-**Host-Native App Builder solves this by:**
-* Using **EROFS** (Enhanced Read-Only File System) for lightning-fast, highly compressed payloads.
-* Using **Bubblewrap** (`bwrap`) to run the app in a lightweight namespace sandbox.
-* Being **Host-Aware**: It queries your host OS and only bundles dependencies that your system *actually lacks*.
-* Integrating seamlessly: Automatically extracts native icons and `.desktop` files directly into your KDE/GNOME application menu.
+## 🛠️ Prerequisites
 
-## ✨ Key Features
+You are expected to be running an atomic Linux distribution (tested heavily on Fedora Kinoite). 
+You will need:
+* `python3` and `python3-pyqt6`
+* `podman` and `toolbox`
+* `bwrap` (Bubblewrap)
+* `fuse3` and `erofs-utils` (specifically `erofsfuse` and `mkfs.erofs`)
 
-* **Discover-like GUI:** A clean PyQt6 interface to search, browse groups, and queue applications from the Fedora DNF repositories.
-* **Toolbox Backend:** The heavy lifting (downloading RPMs, resolving dependencies, compiling the C wrapper) happens safely inside a Toolbox container, keeping your host completely clean.
-* **Zero-Copy Native Execution:** Uses `erofsfuse` to read the payload directly from the executable binary without copying data to RAM.
-* **Full GPU & Wayland Support:** The sandbox binds `/dev`, `/tmp`, and `/run`, ensuring hardware acceleration and native display server compatibility.
-* **One-Click Integration:** Automatically places the generated `.app` in `~/.local/bin/` and creates a `.desktop` shortcut with the original high-res icon.
+## 📦 Installation & Usage
 
-## 🛠️ Architecture
+1. Place `appimage-builder.py` and `app-builder-gui.py` into `~/.local/bin/`.
+2. Make them executable:
+   ```bash
+   chmod +x ~/.local/bin/appimage-builder.py
+   chmod +x ~/.local/bin/app-builder-gui.py
+   ```
+3. Launch the graphical interface:
+   ```bash
+   python3 ~/.local/bin/app-builder-gui.py
+   ```
+4. On the first launch, the GUI will silently construct the `sysext-builder` container in the background. Once initialized, search for your target application, add it to the Transaction Queue, and build!
 
-The project consists of two main components:
-1. `app-manager-gui.py`: The PyQt6 frontend running on your host system. It handles user interaction and queries local RPM databases.
-2. `appimage-builder.py`: The CLI builder running inside a Toolbox. It downloads packages, creates the EROFS image, compiles a tiny C-based runtime wrapper, and stitches everything into a single `.app` executable.
+## 🛡️ Dynamic Sandbox Control
 
-## 📦 Prerequisites
+Every bundled application gets a beautifully isolated private home directory (`~/.var/app/<app-name>`). 
+Need to give an app access to your real files or hardware? Select the app in the **Installed** tab of the GUI and edit its permissions on the fly:
 
-**On your Host System (Fedora Kinoite/Silverblue):**
-```bash
-rpm-ostree install python3-pyqt6 erofs-utils
-```
-or use sysext for install deps
-
-# Reboot to apply changes
-Inside your Toolbox (named sysext-builder by default):
-
-```Bash
-toolbox create -c sysext-builder
-toolbox enter -c sysext-builder
-sudo dnf install erofs-utils gcc rpm cpio flatpak-spawn
-```
-🚀 Usage
-Clone this repository.
-
-Make both scripts executable: chmod +x app-manager-gui.py appimage-builder.py.
-
-Run the GUI on your host:
-
-Bash
-./app-manager-gui.py
-Search for an app (e.g., krusader), right-click to add to the queue, and hit Build App.
-
-Once finished, launch your new app directly from your desktop environment's application launcher!
-
-📝 License
-[GPLv2]
+* **Bind Mounts:** Add `/var/home/username` to let a file manager see your files. Add `/run/media` for external drives.
+* **Masks:** Want to hide a specific host path from the application? Add it here, and the sandbox will overlay it with an empty `tmpfs`.
+* *Note: Changes to the sandbox apply immediately on the next application launch. No rebuild required.*
