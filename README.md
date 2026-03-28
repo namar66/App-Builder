@@ -1,4 +1,4 @@
-# Atomic AppImage Creator Pro
+# Atomic AppImage Creator Pro (still under construstion)
 
 An unapologetically advanced, hyper-secure, and self-healing application packager and sandbox manager built specifically for Fedora Atomic desktops (Kinoite/Silverblue). 
 
