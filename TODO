@@ -1,0 +1,32 @@
+🛠️ TODO: The Roadmap
+1. Vizuální správce oprávnění (Flatseal-killer)
+
+Zahodíme ty dvě holá textová pole a nahradíme je elegantní mřížkou zaškrtávátek v GUI.
+
+Přepínače pro: 🌐 Síť (Network), 🔊 Zvuk (PulseAudio/PipeWire), 🖥️ Zobrazení (Wayland fallback na X11), 🎮 Akcelerace (GPU/DRI), 🖨️ Tiskárny, atd.
+
+GUI tyhle přepínače přeloží a dynamicky vygeneruje soubor flags.txt, který si náš C wrapper načte.
+
+2. Totální síťová a procesní izolace
+
+Aktuálně mají naše kontejnery plný přístup k internetu a vidí procesy hostitele.
+
+Přidáme do Bubblewrapu natvrdo --unshare-ipc, --unshare-pid, --unshare-uts, a pokud uživatel v GUI odškrtne síť, tak i --unshare-net. Aplikace pak uvidí jen svůj vlastní izolovaný mikrosvět a nestáhne si ani bajt.
+
+3. D-Bus Proxy (Zalepení největší díry)
+
+Teď tam docela prasácky mountujeme rovnou celý /run/dbus. To je sice fajn pro funkčnost, ale z pohledu bezpečnosti je to díra jak vrata, protože appka může přes D-Bus komandovat hostitelský systém.
+
+Implementujeme xdg-dbus-proxy. Místo celého socketu propustíme do sandboxu jen přesně definované D-Bus names (třeba jen org.freedesktop.Notifications pro notifikace), a zbytek nekompromisně zařízneme.
+
+4. XDG Desktop Portals & MIME
+
+Když teď v nějaké naší appce klikneš na webový odkaz, pravděpodobně to chcípne, protože uvnitř toho EROFS obrazu není prohlížeč.
+
+Musíme zajistit, aby proměnná GTK_USE_PORTAL=1 reálně komunikovala s hostitelským xdg-desktop-portal. Odkaz nebo požadavek na otevření souboru musí "vybublat" bezpečně ven ze sandboxu a otevřít se v tvém normálním prohlížeči v hostitelském KDE.
+
+5. Tichý Auto-Updater na pozadí
+
+Tlačítko "Update" už máme, ale jsme líní. Uděláme systemd timer nebo background worker, co si v Toolboxu tiše zjistí, že uvolnili novou verzi (třeba pro ten Krusader).
+
+Na pozadí stáhne RPM, přebalí nový EROFS obraz, a jakmile aplikaci zavřeš, jenom bleskově prohodí ten starý .app soubor za nový. Úplně bez tvého zásahu.
