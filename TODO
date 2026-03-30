@@ -30,3 +30,16 @@ Musíme zajistit, aby proměnná GTK_USE_PORTAL=1 reálně komunikovala s hostit
 Tlačítko "Update" už máme, ale jsme líní. Uděláme systemd timer nebo background worker, co si v Toolboxu tiše zjistí, že uvolnili novou verzi (třeba pro ten Krusader).
 
 Na pozadí stáhne RPM, přebalí nový EROFS obraz, a jakmile aplikaci zavřeš, jenom bleskově prohodí ten starý .app soubor za nový. Úplně bez tvého zásahu.
+
+6. Multi-package Bundling (Sloučení pluginů a témat)
+
+Problém: GUI aktuálně považuje každou položku v Transaction Queue za samostatnou aplikaci a na každou volá samostatný build proces.
+
+Řešení v GUI: Musíme do fronty přidat logiku "Hlavní aplikace" a "Přívěsek/Závislost". Možnosti jsou dvě:
+
+A) Přidat nad frontu obří tlačítko „Merge Queue into Single App“ (vše ve frontě se zabalí pod jménem prvního balíčku).
+
+B) V kontextovém menu přidat možnost „Add as extra package to...“ a vybrat už existující aplikaci ve frontě.
+
+Cíl: Aby GUI reálně vzalo ty balíčky a poslalo je do našeho builderu jako jeden nabušený příkaz: ./appimage-builder.py smplayer Host-Native smplayer smplayer-themes.
+(Vtipné je, že ten náš zadní appimage-builder.py už tohle zřetězení balíčků vlastně umí přijmout a zpracovat, jen mu to to naše GUI doteď neumělo správně předat).
