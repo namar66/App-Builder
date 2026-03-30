@@ -1,17 +1,17 @@
 🛠️ TODO: The Roadmap
-1. Vizuální správce oprávnění (Flatseal-killer)
+[x]1. Vizuální správce oprávnění (Flatseal-killer)
 
-Zahodíme ty dvě holá textová pole a nahradíme je elegantní mřížkou zaškrtávátek v GUI.
+()Zahodíme ty dvě holá textová pole a nahradíme je elegantní mřížkou zaškrtávátek v GUI.
 
-Přepínače pro: 🌐 Síť (Network), 🔊 Zvuk (PulseAudio/PipeWire), 🖥️ Zobrazení (Wayland fallback na X11), 🎮 Akcelerace (GPU/DRI), 🖨️ Tiskárny, atd.
+(x)Přepínače pro: 🌐 Síť (Network), 🔊 Zvuk (PulseAudio/PipeWire), 🖥️ Zobrazení (Wayland fallback na X11), 🎮 Akcelerace (GPU/DRI), 🖨️ Tiskárny, atd.
 
-GUI tyhle přepínače přeloží a dynamicky vygeneruje soubor flags.txt, který si náš C wrapper načte.
+(x)GUI tyhle přepínače přeloží a dynamicky vygeneruje soubor flags.txt, který si náš C wrapper načte.
 
-2. Totální síťová a procesní izolace
+[x]2. Totální síťová a procesní izolace
 
-Aktuálně mají naše kontejnery plný přístup k internetu a vidí procesy hostitele.
+(x)Aktuálně mají naše kontejnery plný přístup k internetu a vidí procesy hostitele.
 
-Přidáme do Bubblewrapu natvrdo --unshare-ipc, --unshare-pid, --unshare-uts, a pokud uživatel v GUI odškrtne síť, tak i --unshare-net. Aplikace pak uvidí jen svůj vlastní izolovaný mikrosvět a nestáhne si ani bajt.
+(x)Přidáme do Bubblewrapu natvrdo --unshare-ipc, --unshare-pid, --unshare-uts, a pokud uživatel v GUI odškrtne síť, tak i --unshare-net. Aplikace pak uvidí jen svůj vlastní izolovaný mikrosvět a nestáhne si ani bajt.
 
 3. D-Bus Proxy (Zalepení největší díry)
 
