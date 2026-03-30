@@ -13,11 +13,11 @@
 
 (x)Přidáme do Bubblewrapu natvrdo --unshare-ipc, --unshare-pid, --unshare-uts, a pokud uživatel v GUI odškrtne síť, tak i --unshare-net. Aplikace pak uvidí jen svůj vlastní izolovaný mikrosvět a nestáhne si ani bajt.
 
-3. D-Bus Proxy (Zalepení největší díry)
+[x]3. D-Bus Proxy (Zalepení největší díry)
 
-Teď tam docela prasácky mountujeme rovnou celý /run/dbus. To je sice fajn pro funkčnost, ale z pohledu bezpečnosti je to díra jak vrata, protože appka může přes D-Bus komandovat hostitelský systém.
+(x)Teď tam docela prasácky mountujeme rovnou celý /run/dbus. To je sice fajn pro funkčnost, ale z pohledu bezpečnosti je to díra jak vrata, protože appka může přes D-Bus komandovat hostitelský systém.
 
-Implementujeme xdg-dbus-proxy. Místo celého socketu propustíme do sandboxu jen přesně definované D-Bus names (třeba jen org.freedesktop.Notifications pro notifikace), a zbytek nekompromisně zařízneme.
+(x)Implementujeme xdg-dbus-proxy. Místo celého socketu propustíme do sandboxu jen přesně definované D-Bus names (třeba jen org.freedesktop.Notifications pro notifikace), a zbytek nekompromisně zařízneme.
 
 4. XDG Desktop Portals & MIME
 
