@@ -712,27 +712,128 @@ class SysextAdvancedGUI(QMainWindow):
 
     def load_permissions(self, app_name):
         self.tab_permissions.setEnabled(True)
+
+        # Reset UI to paranoid default state before loading
+        self.chk_network.setChecked(False)
+        self.chk_wayland.setChecked(False)
+        self.chk_x11.setChecked(False)
+        self.chk_pulseaudio.setChecked(False)
+        self.chk_dri.setChecked(False)
+        self.chk_ipc.setChecked(True)
+        self.chk_dbus_user.setChecked(False)
+        self.chk_nosandbox.setChecked(False)
+        self.edit_dbus.clear()
+        self.edit_binds.clear()
+        self.edit_masks.clear()
+
         app_dir = os.path.expanduser(f"~/.var/app/{app_name}")
+        metadata_file = os.path.join(app_dir, "metadata")
 
-        binds_file = os.path.join(app_dir, "binds.txt")
-        if os.path.exists(binds_file):
-            with open(binds_file, "r") as f: self.edit_binds.setPlainText(f.read())
-        else: self.edit_binds.clear()
+        if not os.path.exists(metadata_file):
+            return
 
-        masks_file = os.path.join(app_dir, "masks.txt")
-        if os.path.exists(masks_file):
-            with open(masks_file, "r") as f: self.edit_masks.setPlainText(f.read())
-        else: self.edit_masks.clear()
+        parser = configparser.ConfigParser()
+        parser.optionxform = str # Prevent python from lowercasing DBus paths
+
+        try:
+            parser.read(metadata_file)
+        except Exception as e:
+            QMessageBox.warning(self, "Parse Error", f"Failed to read metadata for {app_name}:\n{e}")
+            return
+
+        dbus_texts = []
+        binds_texts = []
+
+        if parser.has_section("Context"):
+            shared = parser.get("Context", "shared", fallback="").split(";")
+            if "network" in shared: self.chk_network.setChecked(True)
+            if "ipc" in shared: self.chk_ipc.setChecked(False)
+
+            sockets = parser.get("Context", "sockets", fallback="").split(";")
+            if "wayland" in sockets: self.chk_wayland.setChecked(True)
+            if "x11" in sockets or "fallback-x11" in sockets: self.chk_x11.setChecked(True)
+            if "pulseaudio" in sockets: self.chk_pulseaudio.setChecked(True)
+
+            devices = parser.get("Context", "devices", fallback="").split(";")
+            if "dri" in devices: self.chk_dri.setChecked(True)
+
+            filesystems = parser.get("Context", "filesystems", fallback="").split(";")
+            for fs in filesystems:
+                if fs: binds_texts.append(fs)
+
+        if parser.has_section("Session Bus Policy"):
+            self.chk_dbus_user.setChecked(True)
+            for bus_name, policy in parser.items("Session Bus Policy"):
+                dbus_texts.append(f"--{policy}={bus_name}")
+
+        # Custom section for our Sysext specific features
+        if parser.has_section("Sysext"):
+            if parser.getboolean("Sysext", "nosandbox", fallback=False):
+                self.chk_nosandbox.setChecked(True)
+
+            masks = parser.get("Sysext", "masks", fallback="").split(";")
+            self.edit_masks.setPlainText("\n".join([m for m in masks if m]))
+
+        self.edit_dbus.setPlainText("\n".join(dbus_texts))
+        self.edit_binds.setPlainText("\n".join(binds_texts))
 
     def save_permissions(self):
         if not self.selected_installed_app: return
+
         app_dir = os.path.expanduser(f"~/.var/app/{self.selected_installed_app}")
         os.makedirs(app_dir, exist_ok=True)
+        metadata_file = os.path.join(app_dir, "metadata")
 
-        with open(os.path.join(app_dir, "binds.txt"), "w") as f: f.write(self.edit_binds.toPlainText())
-        with open(os.path.join(app_dir, "masks.txt"), "w") as f: f.write(self.edit_masks.toPlainText())
+        parser = configparser.ConfigParser()
+        parser.optionxform = str
 
-        QMessageBox.information(self, "Saved", f"Sandbox permissions for {self.selected_installed_app} updated!")
+        # 1. Build [Context] section
+        parser.add_section("Context")
+
+        shared = []
+        if self.chk_network.isChecked(): shared.append("network")
+        if not self.chk_ipc.isChecked(): shared.append("ipc")
+        if shared: parser.set("Context", "shared", ";".join(shared) + ";")
+
+        sockets = []
+        if self.chk_wayland.isChecked(): sockets.append("wayland")
+        if self.chk_x11.isChecked(): sockets.append("fallback-x11")
+        if self.chk_pulseaudio.isChecked(): sockets.append("pulseaudio")
+        if sockets: parser.set("Context", "sockets", ";".join(sockets) + ";")
+
+        devices = []
+        if self.chk_dri.isChecked(): devices.append("dri")
+        if devices: parser.set("Context", "devices", ";".join(devices) + ";")
+
+        binds = [b.strip() for b in self.edit_binds.toPlainText().splitlines() if b.strip()]
+        if binds: parser.set("Context", "filesystems", ";".join(binds) + ";")
+
+        # 2. Build [Session Bus Policy] section
+        dbus_lines = [d.strip() for d in self.edit_dbus.toPlainText().splitlines() if d.strip()]
+        if dbus_lines:
+            parser.add_section("Session Bus Policy")
+            for line in dbus_lines:
+                if line.startswith("--talk="):
+                    parser.set("Session Bus Policy", line.split("=")[1], "talk")
+                elif line.startswith("--own="):
+                    parser.set("Session Bus Policy", line.split("=")[1], "own")
+
+        # 3. Build custom [Sysext] section
+        parser.add_section("Sysext")
+        if self.chk_nosandbox.isChecked():
+            parser.set("Sysext", "nosandbox", "true")
+
+        masks = [m.strip() for m in self.edit_masks.toPlainText().splitlines() if m.strip()]
+        if masks:
+            parser.set("Sysext", "masks", ";".join(masks) + ";")
+
+        # Write to file
+        try:
+            with open(metadata_file, "w") as f:
+                parser.write(f)
+            QMessageBox.information(self, "Saved", f"Metadata saved successfully for {self.selected_installed_app}!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save metadata:\n{e}")
 
     def show_context_menu(self, position):
         indexes = self.package_table.selectionModel().selectedRows()
