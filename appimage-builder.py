@@ -4,15 +4,12 @@
 # Generates a fully isolated, standalone executable with embedded EROFS payload.
 # Features: Strict sandbox security, private home, versioning, GPG checks, dynamic binds/masks, Host-Native mode.
 
-
 import struct
 import sys
 import os
-import tempfile
 import shutil
 import subprocess
 import logging
-
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
@@ -119,333 +116,171 @@ def detect_entrypoint(staging_root, app_name):
     return "/usr/bin/bash"
 
 def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, app_mode):
+    logging.info(f"Generating high-performance C wrapper for {app_name}...")
+
+    wrapper_c_path = os.path.join(source_path, f"{app_name}_wrapper.c")
+    wrapper_bin_path = os.path.join(source_path, app_name)
+
     c_code = f"""
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <stdint.h>
-#include <string.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+    #include <limits.h>
+    #include <pwd.h>
+    #include <sys/types.h>
 
-typedef struct __attribute__((packed)) {{
-    uint64_t erofs_offset;
-    uint32_t magic;
-}} app_footer_t;
+    #define MAX_ARGS 1024
 
-int main(int argc, char *argv[]) {{
-    if (argc == 2 && strcmp(argv[1], "--app-version") == 0) {{
-        printf("%s\\n", "{app_version}");
-        return 0;
-    }}
-    if (argc == 2 && strcmp(argv[1], "--app-mode") == 0) {{
-        printf("%s\\n", "{app_mode}");
-        return 0;
-    }}
+    int main(int argc, char *argv[]) {{
+        char *args[MAX_ARGS];
+        int arg_count = 0;
 
-    char self_path[4096];
-    ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
-    if (len == -1) return 1;
-    self_path[len] = '\\0';
-
-    int fd_self = open(self_path, O_RDONLY);
-    if (fd_self < 0) return 1;
-
-    struct stat st;
-    if (fstat(fd_self, &st) != 0) return 1;
-
-    app_footer_t footer;
-    if (lseek(fd_self, st.st_size - sizeof(app_footer_t), SEEK_SET) == -1) return 1;
-    if (read(fd_self, &footer, sizeof(app_footer_t)) != sizeof(app_footer_t)) return 1;
-
-    if (footer.magic != 0x41505049) return 1;
-    close(fd_self);
-
-    char mount_point[] = "/tmp/appmnt.XXXXXX";
-    if (mkdtemp(mount_point) == NULL) return 1;
-
-    char offset_str[64];
-    snprintf(offset_str, sizeof(offset_str), "--offset=%llu", (unsigned long long)footer.erofs_offset);
-
-    pid_t fuse_pid = fork();
-    if (fuse_pid == 0) {{
-        int dev_null = open("/dev/null", O_WRONLY);
-        if (dev_null != -1) {{ dup2(dev_null, 1); dup2(dev_null, 2); close(dev_null); }}
-        char *fuse_args[] = {{"erofsfuse", offset_str, self_path, mount_point, NULL}};
-        execvp(fuse_args[0], fuse_args);
-        exit(1);
-    }}
-
-    usleep(250000);
-
-    char *home = getenv("HOME");
-    if (!home) home = "/";
-
-    char private_home[2048], mkdir_cmd[2048], flags_file[2048];
-    snprintf(private_home, sizeof(private_home), "%s/.var/app/%s", home, "{app_name}");
-    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", private_home);
-    system(mkdir_cmd);
-    snprintf(flags_file, sizeof(flags_file), "%s/flags.txt", private_home);
-
-    int disable_sandbox = 0;
-    FILE *ff_init = fopen(flags_file, "r");
-    if (ff_init) {{
-        char line[2048];
-        while (fgets(line, sizeof(line), ff_init)) {{
-            line[strcspn(line, "\\n")] = 0;
-            if (strcmp(line, "DISABLE_SANDBOX") == 0) disable_sandbox = 1;
+        void add_arg(const char *arg) {{
+            if (arg_count < MAX_ARGS - 1) {{
+                args[arg_count++] = strdup(arg);
+            }}
         }}
-        fclose(ff_init);
-    }}
 
-    // --- SECURITY FIX: XDG-DBUS-PROXY INITIALIZATION ---
-    pid_t dbus_proxy_pid = 0;
-    char dbus_proxy_dir[] = "/tmp/dbusproxy.XXXXXX";
-    char proxy_socket_src[2048] = "";
+        add_arg("bwrap");
 
-    char dbus_session_file[2048];
-    snprintf(dbus_session_file, sizeof(dbus_session_file), "%s/dbus-session.txt", private_home);
+        // --- Base isolated filesystem mounts ---
+        add_arg("--ro-bind"); add_arg("/usr"); add_arg("/usr");
+        add_arg("--symlink"); add_arg("usr/lib"); add_arg("/lib");
+        add_arg("--symlink"); add_arg("usr/lib64"); add_arg("/lib64");
+        add_arg("--symlink"); add_arg("usr/bin"); add_arg("/bin");
+        add_arg("--symlink"); add_arg("usr/sbin"); add_arg("/sbin");
+        add_arg("--dev"); add_arg("/dev");
+        add_arg("--proc"); add_arg("/proc");
+        add_arg("--ro-bind"); add_arg("/etc/resolv.conf"); add_arg("/etc/resolv.conf");
 
-    FILE *dbus_f = fopen(dbus_session_file, "r");
-    if (dbus_f) {{
-        int allow_all = 0;
-        char line[2048];
-        while (fgets(line, sizeof(line), dbus_f)) {{
-            line[strcspn(line, "\\n")] = 0;
-            if (strcmp(line, "ALLOW_ALL") == 0) allow_all = 1;
+        // Essential GUI configs (Fonts, Icons, Themes)
+        add_arg("--ro-bind-try"); add_arg("/etc/fonts"); add_arg("/etc/fonts");
+        add_arg("--ro-bind-try"); add_arg("/usr/share/fonts"); add_arg("/usr/share/fonts");
+        add_arg("--ro-bind-try"); add_arg("/usr/share/icons"); add_arg("/usr/share/icons");
+        add_arg("--ro-bind-try"); add_arg("/usr/share/themes"); add_arg("/usr/share/themes");
+
+        // Pass essential Environment Variables for Display
+        if (getenv("WAYLAND_DISPLAY")) {{
+            add_arg("--setenv"); add_arg("WAYLAND_DISPLAY"); add_arg(getenv("WAYLAND_DISPLAY"));
         }}
-        rewind(dbus_f);
+        if (getenv("DISPLAY")) {{
+            add_arg("--setenv"); add_arg("DISPLAY"); add_arg(getenv("DISPLAY"));
+        }}
+        if (getenv("XDG_RUNTIME_DIR")) {{
+            add_arg("--ro-bind-try"); add_arg(getenv("XDG_RUNTIME_DIR")); add_arg(getenv("XDG_RUNTIME_DIR"));
+            add_arg("--setenv"); add_arg("XDG_RUNTIME_DIR"); add_arg(getenv("XDG_RUNTIME_DIR"));
+        }}
+        if (getenv("XAUTHORITY")) {{
+            add_arg("--ro-bind-try"); add_arg(getenv("XAUTHORITY")); add_arg(getenv("XAUTHORITY"));
+            add_arg("--setenv"); add_arg("XAUTHORITY"); add_arg(getenv("XAUTHORITY"));
+        }}
 
-        if (allow_all || disable_sandbox) {{
-            // Map the real host D-Bus directly
-            snprintf(proxy_socket_src, sizeof(proxy_socket_src), "/run/user/%d/bus", getuid());
+        char home_dir[PATH_MAX];
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) {{
+            strncpy(home_dir, pw->pw_dir, sizeof(home_dir) - 1);
         }} else {{
-            if (mkdtemp(dbus_proxy_dir) != NULL) {{
-                snprintf(proxy_socket_src, sizeof(proxy_socket_src), "%s/bus", dbus_proxy_dir);
-                dbus_proxy_pid = fork();
-                if (dbus_proxy_pid == 0) {{
-                    // Child: Start proxy server
-                    int dev_null = open("/dev/null", O_WRONLY);
-                    if (dev_null != -1) {{ dup2(dev_null, 1); dup2(dev_null, 2); close(dev_null); }}
-                    char *proxy_args[1024]; int pa_idx = 0;
-                    proxy_args[pa_idx++] = "xdg-dbus-proxy";
-                    char real_bus[1024]; snprintf(real_bus, sizeof(real_bus), "unix:path=/run/user/%d/bus", getuid());
-                    proxy_args[pa_idx++] = real_bus;
-                    proxy_args[pa_idx++] = proxy_socket_src;
-                    proxy_args[pa_idx++] = "--filter"; // Block everything by default
+            strncpy(home_dir, getenv("HOME"), sizeof(home_dir) - 1);
+        }}
 
-                    // --- FIX: Always allow XDG Desktop Portals ---
-                    proxy_args[pa_idx++] = "--talk=org.freedesktop.portal.*";
+        // --- Parse metadata INI file ---
+        char metadata_path[PATH_MAX];
+        snprintf(metadata_path, sizeof(metadata_path), "%s/.var/app/{app_name}/metadata", home_dir);
 
-                    while (fgets(line, sizeof(line), dbus_f)) {{
-                        line[strcspn(line, "\\n")] = 0;
-                        if (strlen(line) > 0 && strcmp(line, "ALLOW_ALL") != 0) proxy_args[pa_idx++] = strdup(line);
+        int no_sandbox = 0;
+        FILE *meta_file = fopen(metadata_path, "r");
+
+        if (meta_file) {{
+            char line[1024];
+            char current_section[64] = "";
+
+            while (fgets(line, sizeof(line), meta_file)) {{
+                line[strcspn(line, "\\r\\n")] = 0;
+                if (line[0] == '[') {{
+                    sscanf(line, "[%63[^]]]", current_section);
+                    continue;
+                }}
+
+                char *eq = strchr(line, '=');
+                if (!eq) continue;
+                *eq = '\\0';
+                char *key = line;
+                char *val = eq + 1;
+
+                if (strcmp(current_section, \"Context\") == 0) {{
+                    if (strstr(key, \"filesystems\")) {{
+                        char *token = strtok(val, \";\");
+                        while (token) {{
+                            if (strlen(token) > 0) {{
+                                char resolved_path[PATH_MAX];
+                                if (strncmp(token, \"~/\", 2) == 0) {{
+                                    snprintf(resolved_path, sizeof(resolved_path), \"%s/%s\", home_dir, token + 2);
+                                }} else {{
+                                    strncpy(resolved_path, token, sizeof(resolved_path) - 1);
+                                }}
+                                add_arg(\"--bind\"); add_arg(resolved_path); add_arg(resolved_path);
+                            }}
+                            token = strtok(NULL, \";\");
+                        }}
                     }}
-                    proxy_args[pa_idx] = NULL;
-                    execvp(proxy_args[0], proxy_args);
-                    exit(1);
+                    else if (strstr(key, \"shared\")) {{
+                        if (!strstr(val, \"network\")) add_arg(\"--unshare-net\");
+                        if (!strstr(val, \"ipc\")) add_arg(\"--unshare-ipc\");
+                    }}
+                    else if (strstr(key, \"sockets\")) {{
+                        if (strstr(val, \"wayland\")) {{
+                            char wl_path[PATH_MAX];
+                            snprintf(wl_path, sizeof(wl_path), \"/run/user/%d/%s\", getuid(), getenv(\"WAYLAND_DISPLAY\") ? getenv(\"WAYLAND_DISPLAY\") : \"wayland-0\");
+                            add_arg(\"--ro-bind-try\"); add_arg(wl_path); add_arg(wl_path);
+                        }}
+                        if (strstr(val, \"x11\") || strstr(val, \"fallback-x11\")) {{
+                            add_arg(\"--ro-bind-try\"); add_arg(\"/tmp/.X11-unix\"); add_arg(\"/tmp/.X11-unix\");
+                        }}
+                        if (strstr(val, \"pulseaudio\")) {{
+                            char pa_path[PATH_MAX];
+                            snprintf(pa_path, sizeof(pa_path), \"/run/user/%d/pulse\", getuid());
+                            add_arg(\"--ro-bind-try\"); add_arg(pa_path); add_arg(pa_path);
+                        }}
+                    }}
+                    else if (strstr(key, \"devices\")) {{
+                        if (strstr(val, \"dri\")) {{
+                            add_arg(\"--dev-bind\"); add_arg(\"/dev/dri\"); add_arg(\"/dev/dri\");
+                        }}
+                    }}
                 }}
-                usleep(150000);
-            }}
-        }}
-        fclose(dbus_f);
-    }}
-
-    pid_t app_pid = fork();
-    if (app_pid == 0) {{
-        char approot_dir[1024];
-        snprintf(approot_dir, sizeof(approot_dir), "/run/user/%d/approot", getuid());
-
-        char path_env[2048], ld_env[2048], xdg_env[2048], entrypoint_path[2048], libgl_env[2048];
-        snprintf(path_env, sizeof(path_env), "%s/usr/bin:/usr/bin:/bin", approot_dir);
-        snprintf(ld_env, sizeof(ld_env), "%s/usr/lib64:/lib:/lib/pulseaudio:/lib/alsa-lib:/usr/lib64", approot_dir);
-        snprintf(xdg_env, sizeof(xdg_env), "%s/usr/share:/usr/share", approot_dir);
-        snprintf(entrypoint_path, sizeof(entrypoint_path), "%s%s", approot_dir, "{entrypoint_suffix}");
-        snprintf(libgl_env, sizeof(libgl_env), "%s/usr/lib64/dri:/lib/dri:/usr/lib64/dri", approot_dir);
-
-        char *b_args[1024]; int arg_idx = 0;
-        b_args[arg_idx++] = "bwrap";
-
-        if (disable_sandbox) {{
-            b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = "/"; b_args[arg_idx++] = "/";
-            b_args[arg_idx++] = "--dev-bind"; b_args[arg_idx++] = "/dev"; b_args[arg_idx++] = "/dev";
-
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = approot_dir;
-            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = mount_point; b_args[arg_idx++] = approot_dir;
-
-            char opt_bind_src[2048]; snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
-            char opt_bind_dst[2048]; snprintf(opt_bind_dst, sizeof(opt_bind_dst), "%s/opt", approot_dir);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = opt_bind_src; b_args[arg_idx++] = strdup(opt_bind_dst);
-
-            char app_lib[2048]; snprintf(app_lib, sizeof(app_lib), "%s/usr/lib", mount_point);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = app_lib; b_args[arg_idx++] = "/lib";
-        }} else {{
-            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/usr"; b_args[arg_idx++] = "/usr";
-            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/etc"; b_args[arg_idx++] = "/etc";
-            b_args[arg_idx++] = "--dev-bind"; b_args[arg_idx++] = "/dev"; b_args[arg_idx++] = "/dev";
-            b_args[arg_idx++] = "--proc"; b_args[arg_idx++] = "/proc";
-            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/sys"; b_args[arg_idx++] = "/sys";
-            b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = "/tmp";
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/run";
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/run/user";
-
-            char run_user_dir[1024];
-            snprintf(run_user_dir, sizeof(run_user_dir), "/run/user/%d", getuid());
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = strdup(run_user_dir);
-
-            // --- FIX: Mount XDG Document Portal for seamless file sharing ---
-            char doc_portal[1024];
-            snprintf(doc_portal, sizeof(doc_portal), "/run/user/%d/doc", getuid());
-            b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = strdup(doc_portal); b_args[arg_idx++] = strdup(doc_portal);
-
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = "/run/systemd/resolve"; b_args[arg_idx++] = "/run/systemd/resolve";
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = "/run/NetworkManager"; b_args[arg_idx++] = "/run/NetworkManager";
-
-            b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = private_home; b_args[arg_idx++] = home;
-
-            // --- SECURITY FIX: LOCK DOWN SANDBOX CONFIGS ---
-            const char *config_files[] = {{"binds.txt", "masks.txt", "flags.txt", "dbus-session.txt", "deps.txt"}};
-            for (int j = 0; j < 5; j++) {{
-                char cf_src[2048], cf_dest[2048];
-                snprintf(cf_src, sizeof(cf_src), "%s/%s", private_home, config_files[j]);
-                snprintf(cf_dest, sizeof(cf_dest), "%s/%s", home, config_files[j]);
-                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(cf_src); b_args[arg_idx++] = strdup(cf_dest);
-            }}
-
-            if (strlen(proxy_socket_src) > 0) {{
-                char proxy_socket_dest[1024];
-                snprintf(proxy_socket_dest, sizeof(proxy_socket_dest), "/run/user/%d/bus", getuid());
-                b_args[arg_idx++] = "--ro-bind";
-                b_args[arg_idx++] = strdup(proxy_socket_src);
-                b_args[arg_idx++] = strdup(proxy_socket_dest);
-
-                char env_dbus[1024];
-                snprintf(env_dbus, sizeof(env_dbus), "unix:path=%s", proxy_socket_dest);
-                b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "DBUS_SESSION_BUS_ADDRESS"; b_args[arg_idx++] = strdup(env_dbus);
-            }}
-
-            FILE *ff = fopen(flags_file, "r");
-            if (ff) {{
-                char line[2048];
-                while (fgets(line, sizeof(line), ff)) {{
-                    line[strcspn(line, "\\n")] = 0;
-                    if (strlen(line) > 0 && strcmp(line, "DISABLE_SANDBOX") != 0) {{ b_args[arg_idx++] = strdup(line); }}
+                else if (strcmp(current_section, \"Sysext\") == 0) {{
+                    if (strstr(key, \"nosandbox\") && strstr(val, \"true\")) no_sandbox = 1;
                 }}
-                fclose(ff);
             }}
-
-            char host_icons[2048], host_local_icons[2048], kde_config[2048], font_config[2048];
-            snprintf(host_icons, sizeof(host_icons), "%s/.icons", home);
-            snprintf(host_local_icons, sizeof(host_local_icons), "%s/.local/share/icons", home);
-            snprintf(kde_config, sizeof(kde_config), "%s/.config/kdeglobals", home);
-            snprintf(font_config, sizeof(font_config), "%s/.config/fontconfig", home);
-
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_icons; b_args[arg_idx++] = host_icons;
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_local_icons; b_args[arg_idx++] = host_local_icons;
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = kde_config; b_args[arg_idx++] = kde_config;
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = font_config; b_args[arg_idx++] = font_config;
-
-            char binds_file[2048]; snprintf(binds_file, sizeof(binds_file), "%s/binds.txt", private_home);
-            FILE *touch_bf = fopen(binds_file, "a"); if(touch_bf) fclose(touch_bf);
-            FILE *bf = fopen(binds_file, "r");
-            if (bf) {{
-                char line[2048];
-                while (fgets(line, sizeof(line), bf)) {{
-                    line[strcspn(line, "\\n")] = 0;
-                    if (strlen(line) > 0) {{ b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = strdup(line); b_args[arg_idx++] = strdup(line); }}
-                }}
-                fclose(bf);
-            }}
-
-            char masks_file[2048]; snprintf(masks_file, sizeof(masks_file), "%s/masks.txt", private_home);
-            FILE *touch_mf = fopen(masks_file, "a"); if(touch_mf) fclose(touch_mf);
-            FILE *mf = fopen(masks_file, "r");
-            if (mf) {{
-                char line[2048];
-                while (fgets(line, sizeof(line), mf)) {{
-                    line[strcspn(line, "\\n")] = 0;
-                    if (strlen(line) > 0) {{ b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = strdup(line); }}
-                }}
-                fclose(mf);
-            }}
-
-            const char *sensitive_paths[] = {{".bashrc", ".bash_profile", ".bash_logout", ".profile", ".zshrc", ".ssh", ".config/autostart"}};
-            for (int j = 0; j < 7; j++) {{
-                char sp1[2048], sp2[2048];
-                snprintf(sp1, sizeof(sp1), "%s/%s", home, sensitive_paths[j]);
-                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp1); b_args[arg_idx++] = strdup(sp1);
-                snprintf(sp2, sizeof(sp2), "%s/%s", private_home, sensitive_paths[j]);
-                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp2); b_args[arg_idx++] = strdup(sp2);
-            }}
-
-            b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = "/etc/ssl";
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/etc/ssl/certs";
-            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-certificates.crt";
-            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-bundle.crt";
-
-            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/bin"; b_args[arg_idx++] = "/bin";
-            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/sbin"; b_args[arg_idx++] = "/sbin";
-            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/lib64"; b_args[arg_idx++] = "/lib64";
-
-            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = approot_dir;
-            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = mount_point; b_args[arg_idx++] = approot_dir;
-
-            char opt_bind_src[2048]; snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
-            char opt_bind_dst[2048]; snprintf(opt_bind_dst, sizeof(opt_bind_dst), "%s/opt", approot_dir);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = opt_bind_src; b_args[arg_idx++] = strdup(opt_bind_dst);
-
-            char app_lib[2048]; snprintf(app_lib, sizeof(app_lib), "%s/usr/lib", mount_point);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = app_lib; b_args[arg_idx++] = "/lib";
+            fclose(meta_file);
         }}
 
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "PATH"; b_args[arg_idx++] = path_env;
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "LD_LIBRARY_PATH"; b_args[arg_idx++] = ld_env;
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "XDG_DATA_DIRS"; b_args[arg_idx++] = xdg_env;
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "LIBGL_DRIVERS_PATH"; b_args[arg_idx++] = libgl_env;
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "GTK_USE_PORTAL"; b_args[arg_idx++] = "1";
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "SSL_CERT_DIR"; b_args[arg_idx++] = "/etc/pki/tls/certs";
-        b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "SSL_CERT_FILE"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt";
+        add_arg(\"{entrypoint_suffix}\");
+        for (int i = 1; i < argc; i++) add_arg(argv[i]);
+        args[arg_count] = NULL;
 
-        b_args[arg_idx++] = entrypoint_path;
-        if (strstr(entrypoint_path, "steam") != NULL) b_args[arg_idx++] = "-no-cef-sandbox";
-        if (strstr(entrypoint_path, "chromium") != NULL || strstr(entrypoint_path, "chrome") != NULL || strstr(entrypoint_path, "brave") != NULL) {{
-            b_args[arg_idx++] = "--no-sandbox";
+        if (no_sandbox) {{
+            execvp(\"{entrypoint_suffix}\", &argv[0]);
+            perror(\"Bypass failed\");
+            return 1;
         }}
 
-        for (int i = 1; i < argc && arg_idx < 1023; i++) b_args[arg_idx++] = argv[i];
-        b_args[arg_idx] = NULL;
-
-        execvp(b_args[0], b_args);
-        exit(1);
+        execvp(\"bwrap\", args);
+        perror(\"Bwrap failed\");
+        return 1;
     }}
+    """
 
-    int status;
-    waitpid(app_pid, &status, 0);
-
-    if (dbus_proxy_pid > 0) {{
-        kill(dbus_proxy_pid, SIGTERM);
-        waitpid(dbus_proxy_pid, NULL, 0);
-        unlink(proxy_socket_src);
-        rmdir(dbus_proxy_dir);
-    }}
-
-    pid_t umount_pid = fork();
-    if (umount_pid == 0) {{
-        int dev_null = open("/dev/null", O_WRONLY);
-        if (dev_null != -1) {{ dup2(dev_null, 1); dup2(dev_null, 2); close(dev_null); }}
-        char *umount_args[] = {{"fusermount3", "-q", "-u", mount_point, NULL}};
-        execvp(umount_args[0], umount_args);
-        exit(1);
-    }}
-    waitpid(umount_pid, NULL, 0);
-    rmdir(mount_point);
-    return WEXITSTATUS(status);
-}}
-"""
-    with open(source_path, "w") as f:
-        f.write(c_code)
+    try:
+        with open(wrapper_c_path, "w") as f:
+         f.write(c_code)
+        subprocess.run(["gcc", "-O3", "-s", "-o", wrapper_bin_path, wrapper_c_path], check=True)
+        os.remove(wrapper_c_path)
+        return wrapper_bin_path
+    except Exception as e:
+        logging.error(f"Error generating wrapper: {{e}}")
+        raise
 
 def stitch_app(output_app_path, runtime_path, erofs_path):
     with open(output_app_path, "wb") as f_out:
@@ -516,41 +351,6 @@ def integrate_into_system(app_name, final_app_path, staging_root):
         pass
     logging.info(f"Successfully integrated {app_name}. Menu is now updated.")
 
-def build_erofs_container(app_name, build_mode, packages):
-    """
-    Main build logic wrapped in a secure temporary directory manager.
-    Ensures absolute cleanup of the tmpfs workspace on success or failure.
-    """
-    # Create a secure temporary directory in /tmp (tmpfs in Fedora)
-    work_dir = tempfile.mkdtemp(prefix=f"sysext-build-{app_name}-")
-    logging.info(f"Created temporary workspace at: {work_dir}")
-
-    try:
-        # 1. DOWNLOAD RPMs
-        logging.info("Downloading packages via DNF...")
-        # ... paste your existing DNF toolbox download logic here ...
-
-        # 2. EXTRACT RPMs
-        logging.info("Extracting RPMs using rpm2cpio...")
-        # ... paste your existing extraction and manipulation logic here ...
-
-        # 3. BUILD EROFS
-        logging.info("Compiling EROFS image...")
-        # ... paste your mkfs.erofs execution here ...
-
-        logging.info(f"Successfully built {app_name}.app!")
-
-    except Exception as e:
-        # Catch any failure during the build process
-        logging.critical(f"Build process failed for {app_name}: {e}")
-        sys.exit(1)
-
-    finally:
-        # THE GARBAGE COLLECTOR - This executes NO MATTER WHAT happens above
-        if os.path.exists(work_dir):
-            logging.info(f"Obliterating temporary workspace to free RAM: {work_dir}")
-            shutil.rmtree(work_dir)
-
 def main():
     if len(sys.argv) < 3:
         print("Usage: appimage-builder.py <App-Name> <Portable|Host-Native> [Package1 ...]")
@@ -563,8 +363,6 @@ def main():
     output_dir = os.path.abspath("./")
     build_dir = f"/var/tmp/app-build-{name}"
     staging_root = os.path.join(build_dir, "root")
-
-    build_erofs_container(app_name, build_mode, packages)
 
     try:
         if os.path.exists(build_dir):
@@ -606,21 +404,17 @@ def main():
         app_version = "unknown"
         logging.info("Detecting package version...")
 
-        # --- NEW: Generate dependency list (deps.txt) ---
         deps_list = []
         logging.info("Generating dependency manifest...")
         for rpm in rpms_to_extract:
-            # Extract exact package name and version from RPM
             res = subprocess.run(["rpm", "-qp", "--queryformat", "%{NAME}-%{VERSION}-%{RELEASE}", rpm], capture_output=True, text=True, errors="replace")
             if res.returncode == 0:
                 deps_list.append(res.stdout.strip())
 
-        # Save deps.txt directly to ~/.var/app/<app_name>/
         app_private_home = os.path.expanduser(f"~/.var/app/{name}")
         os.makedirs(app_private_home, exist_ok=True)
         with open(os.path.join(app_private_home, "deps.txt"), "w") as f:
             f.write("\n".join(sorted(deps_list)))
-        # --------------------------------------------------------
 
         for rpm in rpms_to_extract:
             if name.lower() in os.path.basename(rpm).lower():
@@ -668,10 +462,8 @@ def main():
         logging.info("Building EROFS filesystem...")
         run_cmd(cmd_erofs)
 
-        c_source_path = os.path.join(build_dir, "wrapper.c")
-        runtime_bin_path = os.path.join(build_dir, "runtime")
-        generate_c_wrapper(c_source_path, entrypoint_suffix, name, app_version, app_mode)
-        run_cmd(["gcc", "-O2", c_source_path, "-o", runtime_bin_path])
+        # Let the generator do its job and catch the returned binary path directly
+        runtime_bin_path = generate_c_wrapper(build_dir, entrypoint_suffix, name, app_version, app_mode)
 
         final_app_path = os.path.join(output_dir, f"{name}.app")
         stitch_app(final_app_path, runtime_bin_path, erofs_payload)
@@ -684,5 +476,4 @@ def main():
             logging.info("Cleaned up build directory.")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     main()
