@@ -335,6 +335,30 @@ class BuildAsyncWorker(QThread):
 
         self.finished_all.emit()
 
+class FlatpakProfileWorker(QThread):
+    finished_success = pyqtSignal(str, str)
+    finished_error = pyqtSignal(str)
+
+    def __init__(self, app_id):
+        super().__init__()
+        self.app_id = app_id
+
+    def run(self):
+        try:
+            # 15s timeout so we don't hang forever on bad networks
+            res = subprocess.run(
+                ["flatpak", "remote-info", "--show-metadata", "flathub", self.app_id],
+                capture_output=True, text=True, timeout=15
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                self.finished_success.emit(self.app_id, res.stdout.strip())
+            else:
+                self.finished_error.emit(f"Failed to fetch metadata for {self.app_id}.\nMake sure the ID is correct and Flathub is reachable.")
+        except subprocess.TimeoutExpired:
+            self.finished_error.emit(f"Connection timed out while fetching metadata for {self.app_id}.")
+        except Exception as e:
+            self.finished_error.emit(f"Unexpected error occurred: {str(e)}")
+
 class SysextAdvancedGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -563,17 +587,20 @@ class SysextAdvancedGUI(QMainWindow):
             QMessageBox.information(self, "Loaded", "Profile loaded from your local offline database.")
             return
 
-        # Fetch INI metadata directly from Flathub using CLI hack
+        # Fetch INI metadata asynchronously using the new Worker
         self.status_label.setText(f"⏳ Fetching INI metadata for {app_id} from Flathub...")
+        self.btn_load_profile.setEnabled(False) # Lock the button to prevent spamming
         QApplication.processEvents()
 
-        res = subprocess.run(["flatpak", "remote-info", "--show-metadata", "flathub", app_id], capture_output=True, text=True)
-        metadata_content = res.stdout.strip()
+        self.profile_worker = FlatpakProfileWorker(app_id)
+        self.profile_worker.finished_success.connect(self.on_profile_fetched)
+        self.profile_worker.finished_error.connect(self.on_profile_error)
+        self.profile_worker.start()
 
-        if not metadata_content or res.returncode != 0:
-            QMessageBox.warning(self, "Error", f"Failed to fetch metadata for {app_id}.\nMake sure the ID is correct and flathub remote is configured on your host.")
-            self.status_label.setText("✅ Ready.")
-            return
+    def on_profile_fetched(self, app_id, metadata_content):
+        self.btn_load_profile.setEnabled(True)
+        dbus_texts = []
+        binds_texts = []
 
         # Magic INI parsing
         parser = configparser.ConfigParser()
@@ -617,6 +644,11 @@ class SysextAdvancedGUI(QMainWindow):
 
         self.status_label.setText("✅ Profile applied.")
         QMessageBox.information(self, "Success", f"Metadata for {app_id} successfully parsed from Flathub!")
+
+    def on_profile_error(self, error_msg):
+        self.btn_load_profile.setEnabled(True)
+        self.status_label.setText("❌ Profile fetch failed.")
+        QMessageBox.warning(self, "Error", error_msg)
 
     def on_category_changed(self, index):
         self.package_model.removeRows(0, self.package_model.rowCount())
