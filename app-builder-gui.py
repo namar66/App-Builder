@@ -9,11 +9,14 @@ import os
 import subprocess
 import logging
 import re
+import shutil
+import json
+import configparser
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QSplitter, QListWidget, QTableView,
                              QLineEdit, QTabWidget, QTextEdit, QLabel, QPushButton,
                              QHeaderView, QMenu, QMessageBox, QAbstractItemView,
-                             QComboBox)
+                             QComboBox, QCheckBox, QInputDialog, QGridLayout, QGroupBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QAction
 
@@ -246,10 +249,11 @@ class BuildAsyncWorker(QThread):
     finished_all = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, queue, mode):
+    def __init__(self, queue, mode, merge=False):
         super().__init__()
         self.queue = queue
         self.mode = mode
+        self.merge = merge
 
     def run(self):
         builder_script = os.path.expanduser("~/.local/bin/appimage-builder.py")
@@ -257,18 +261,22 @@ class BuildAsyncWorker(QThread):
             self.error.emit(f"Builder script not found at {builder_script}. Ensure it is placed in ~/.local/bin/")
             return
 
-        for app_name in self.queue:
-            self.log_msg.emit(f"<br><b style='color: #2e8b57;'>--- Preparing {app_name} in {self.mode} mode ---</b>")
+        # Handle Merged Queue
+        if self.merge and self.queue:
+            main_app = self.queue[0]
+            self.log_msg.emit(f"<br><b style='color: #2e8b57;'>--- Preparing MERGED build for {main_app} in {self.mode} mode ---</b>")
+            self.log_msg.emit(f"<i>Packages included: {', '.join(self.queue)}</i>")
 
-            final_packages = [app_name]
+            final_packages = self.queue
 
             if self.mode == "Host-Native":
                 self.log_msg.emit("<i>Analyzing host dependencies via rpm-ostree...</i>")
-                deps = calculate_host_dependencies([app_name])
+                deps = calculate_host_dependencies(final_packages)
 
                 if deps == "ALREADY_INSTALLED":
-                    self.log_msg.emit(f"<b style='color: #d18c00;'>Skipping:</b> Application '{app_name}' is already provided by the host system.")
-                    continue
+                    self.log_msg.emit(f"<b style='color: #d18c00;'>Skipping:</b> All requested packages are already provided by the host system.")
+                    self.finished_all.emit()
+                    return
                 elif deps == "ERROR":
                     self.log_msg.emit(f"<span style='color:red;'>Error:</span> Host dependency calculation failed. Falling back to simple bundle.")
                 else:
@@ -276,7 +284,7 @@ class BuildAsyncWorker(QThread):
                     self.log_msg.emit(f"<i>Found {len(final_packages)} required packages to bundle.</i>")
 
             self.log_msg.emit(f"<i>Starting builder inside toolbox...</i>")
-            cmd = ["toolbox", "run", "-c", "sysext-builder", "env", "LANG=C", builder_script, app_name, self.mode] + final_packages
+            cmd = ["toolbox", "run", "-c", "sysext-builder", "env", "LANG=C", builder_script, main_app, self.mode] + final_packages
 
             try:
                 process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
@@ -284,11 +292,46 @@ class BuildAsyncWorker(QThread):
                 process.wait()
 
                 if process.returncode == 0:
-                    self.log_msg.emit(f"<b style='color: #005cc5;'>--- Successfully finished {app_name} ---</b><br>")
+                    self.log_msg.emit(f"<b style='color: #005cc5;'>--- Successfully finished merged app: {main_app} ---</b><br>")
                 else:
-                    self.log_msg.emit(f"<b style='color: red;'>--- Build failed for {app_name} (Exit code: {process.returncode}) ---</b><br>")
+                    self.log_msg.emit(f"<b style='color: red;'>--- Build failed for {main_app} (Exit code: {process.returncode}) ---</b><br>")
             except Exception as e:
-                self.error.emit(f"Execution error for {app_name}: {str(e)}")
+                self.error.emit(f"Execution error for {main_app}: {str(e)}")
+
+        else:
+            # Original loop for individual apps
+            for app_name in self.queue:
+                self.log_msg.emit(f"<br><b style='color: #2e8b57;'>--- Preparing {app_name} in {self.mode} mode ---</b>")
+
+                final_packages = [app_name]
+
+                if self.mode == "Host-Native":
+                    self.log_msg.emit("<i>Analyzing host dependencies via rpm-ostree...</i>")
+                    deps = calculate_host_dependencies([app_name])
+
+                    if deps == "ALREADY_INSTALLED":
+                        self.log_msg.emit(f"<b style='color: #d18c00;'>Skipping:</b> Application '{app_name}' is already provided by the host system.")
+                        continue
+                    elif deps == "ERROR":
+                        self.log_msg.emit(f"<span style='color:red;'>Error:</span> Host dependency calculation failed. Falling back to simple bundle.")
+                    else:
+                        final_packages = deps
+                        self.log_msg.emit(f"<i>Found {len(final_packages)} required packages to bundle.</i>")
+
+                self.log_msg.emit(f"<i>Starting builder inside toolbox...</i>")
+                cmd = ["toolbox", "run", "-c", "sysext-builder", "env", "LANG=C", builder_script, app_name, self.mode] + final_packages
+
+                try:
+                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                    for line in process.stdout: self.log_msg.emit(line.strip())
+                    process.wait()
+
+                    if process.returncode == 0:
+                        self.log_msg.emit(f"<b style='color: #005cc5;'>--- Successfully finished {app_name} ---</b><br>")
+                    else:
+                        self.log_msg.emit(f"<b style='color: red;'>--- Build failed for {app_name} (Exit code: {process.returncode}) ---</b><br>")
+                except Exception as e:
+                    self.error.emit(f"Execution error for {app_name}: {str(e)}")
 
         self.finished_all.emit()
 
@@ -344,6 +387,10 @@ class SysextAdvancedGUI(QMainWindow):
         left_layout.addWidget(QLabel("<b>Build Mode</b>"))
         left_layout.addWidget(self.combo_mode)
 
+        self.chk_merge_queue = QCheckBox("🔗 Merge Queue into Single App")
+        self.chk_merge_queue.setToolTip("Combines all packages in the queue into a single .app based on the first item's name.")
+        left_layout.addWidget(self.chk_merge_queue)
+
         self.btn_apply = QPushButton("Apply Transaction")
         self.btn_apply.setEnabled(False)
         self.btn_apply.setStyleSheet("background-color: #2e8b57; color: white; font-weight: bold; padding: 10px;")
@@ -387,26 +434,189 @@ class SysextAdvancedGUI(QMainWindow):
         self.tab_info.setReadOnly(True)
         self.details_tabs.addTab(self.tab_info, "Information")
 
+        # --- REBUILT Sandbox Permissions Tab ---
         self.tab_permissions = QWidget()
         perm_layout = QVBoxLayout(self.tab_permissions)
-        perm_layout.addWidget(QLabel("<b>Bind Mounts (Allowed Host Paths):</b> One absolute path per line"))
+
+        # Load Flathub Profile Button
+        self.btn_load_profile = QPushButton("🌐 Load Profile from Flathub")
+        self.btn_load_profile.setStyleSheet("font-weight: bold; color: #005cc5;")
+        self.btn_load_profile.clicked.connect(self.load_profile)
+        perm_layout.addWidget(self.btn_load_profile)
+
+        # Checkboxes for basic toggles
+        perms_group = QGroupBox("Core Toggles")
+        grid = QGridLayout(perms_group)
+        self.chk_network = QCheckBox("Network")
+        self.chk_wayland = QCheckBox("Wayland")
+        self.chk_x11 = QCheckBox("X11")
+        self.chk_pulseaudio = QCheckBox("PulseAudio")
+        self.chk_dri = QCheckBox("DRI (OpenGL)")
+        self.chk_ipc = QCheckBox("IPC")
+        self.chk_dbus_user = QCheckBox("DBus User")
+        self.chk_nosandbox = QCheckBox("No Sandbox")
+
+        grid.addWidget(self.chk_network, 0, 0)
+        grid.addWidget(self.chk_wayland, 0, 1)
+        grid.addWidget(self.chk_x11, 0, 2)
+        grid.addWidget(self.chk_pulseaudio, 0, 3)
+        grid.addWidget(self.chk_dri, 1, 0)
+        grid.addWidget(self.chk_ipc, 1, 1)
+        grid.addWidget(self.chk_dbus_user, 1, 2)
+        grid.addWidget(self.chk_nosandbox, 1, 3)
+        perm_layout.addWidget(perms_group)
+
+        # D-Bus configuration
+        perm_layout.addWidget(QLabel("<b>D-Bus (Talk/Own):</b> One per line (e.g., --talk=org.freedesktop.Notifications)"))
+        self.edit_dbus = QTextEdit()
+        self.edit_dbus.setMaximumHeight(60)
+        perm_layout.addWidget(self.edit_dbus)
+
+        # Binds & Masks
+        perm_layout.addWidget(QLabel("<b>Bind Mounts (Allowed Paths):</b>"))
         self.edit_binds = QTextEdit()
+        self.edit_binds.setMaximumHeight(60)
         perm_layout.addWidget(self.edit_binds)
-        perm_layout.addWidget(QLabel("<b>Masks (Hidden/Blocked Paths):</b> Overrides allowed paths with empty disk"))
+
+        perm_layout.addWidget(QLabel("<b>Masks (Blocked Paths):</b>"))
         self.edit_masks = QTextEdit()
+        self.edit_masks.setMaximumHeight(60)
         perm_layout.addWidget(self.edit_masks)
+
         self.btn_save_perms = QPushButton("💾 Save Sandbox Permissions")
         self.btn_save_perms.clicked.connect(self.save_permissions)
         perm_layout.addWidget(self.btn_save_perms)
+
         self.details_tabs.addTab(self.tab_permissions, "Sandbox Permissions")
 
         right_splitter.addWidget(top_right_panel)
         right_splitter.addWidget(self.details_tabs)
-        right_splitter.setSizes([500, 200])
+        right_splitter.setSizes([500, 350])
 
         main_splitter.addWidget(left_panel)
         main_splitter.addWidget(right_splitter)
         main_splitter.setSizes([250, 850])
+
+    def get_profiles_db(self):
+        """Dummy method to return local offline database of parsed profiles."""
+        db_path = os.path.expanduser("~/.local/share/app-builder-profiles.json")
+        if os.path.exists(db_path):
+            try:
+                with open(db_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.error(f"Failed to load local DB: {e}")
+        return {}
+
+    def load_profile(self):
+        if not self.selected_installed_app:
+            QMessageBox.information(self, "Notice", "Please select an installed app to apply the profile to.")
+            return
+
+        app_id, ok = QInputDialog.getText(self, "Load Profile", "Enter Flathub ID (e.g. com.spotify.Client):")
+        if not ok or not app_id.strip(): return
+        app_id = app_id.strip()
+
+        # Reset UI to paranoid state
+        self.chk_network.setChecked(False)
+        self.chk_wayland.setChecked(False)
+        self.chk_x11.setChecked(False)
+        self.chk_pulseaudio.setChecked(False)
+        self.chk_dri.setChecked(False)
+        self.chk_ipc.setChecked(True)
+        self.chk_dbus_user.setChecked(False)
+        self.chk_nosandbox.setChecked(False)
+        self.edit_dbus.clear()
+        self.edit_binds.clear()
+
+        db = self.get_profiles_db()
+        dbus_texts = []
+        binds_texts = []
+
+        if app_id in db:
+            args = db[app_id]
+            for arg in args:
+                if arg == "--share=network": self.chk_network.setChecked(True)
+                elif arg == "--socket=wayland": self.chk_wayland.setChecked(True)
+                elif arg in ["--socket=x11", "--socket=fallback-x11"]: self.chk_x11.setChecked(True)
+                elif arg == "--socket=pulseaudio": self.chk_pulseaudio.setChecked(True)
+                elif arg == "--device=dri": self.chk_dri.setChecked(True)
+                elif arg.startswith("--talk-name="):
+                    self.chk_dbus_user.setChecked(True)
+                    dbus_texts.append(f"--talk={arg.split('=')[1]}")
+                elif arg.startswith("--own-name="):
+                    self.chk_dbus_user.setChecked(True)
+                    dbus_texts.append(f"--own={arg.split('=')[1]}")
+                elif arg.startswith("--filesystem="):
+                    path = arg.split('=')[1]
+                    if path == "home": binds_texts.append("~/")
+                    elif path == "xdg-download": binds_texts.append("~/Downloads")
+                    elif path == "xdg-pictures": binds_texts.append("~/Pictures")
+                    elif path == "xdg-music": binds_texts.append("~/Music")
+                    elif path == "xdg-videos": binds_texts.append("~/Videos")
+                    elif path == "xdg-documents": binds_texts.append("~/Documents")
+                    elif path == "host": binds_texts.append("/")
+                    else: binds_texts.append(path)
+
+            self.edit_dbus.setPlainText("\n".join(dbus_texts))
+            self.edit_binds.setPlainText("\n".join(binds_texts))
+            QMessageBox.information(self, "Loaded", "Profile loaded from your local offline database.")
+            return
+
+        # Fetch INI metadata directly from Flathub using CLI hack
+        self.status_label.setText(f"⏳ Fetching INI metadata for {app_id} from Flathub...")
+        QApplication.processEvents()
+
+        res = subprocess.run(["flatpak", "remote-info", "--show-metadata", "flathub", app_id], capture_output=True, text=True)
+        metadata_content = res.stdout.strip()
+
+        if not metadata_content or res.returncode != 0:
+            QMessageBox.warning(self, "Error", f"Failed to fetch metadata for {app_id}.\nMake sure the ID is correct and flathub remote is configured on your host.")
+            self.status_label.setText("✅ Ready.")
+            return
+
+        # Magic INI parsing
+        parser = configparser.ConfigParser()
+        parser.optionxform = str # Prevent python from lowercasing DBus paths
+        parser.read_string(metadata_content)
+
+        if parser.has_section("Context"):
+            shared = parser.get("Context", "shared", fallback="").split(";")
+            if "network" in shared: self.chk_network.setChecked(True)
+            if "ipc" in shared: self.chk_ipc.setChecked(False)
+
+            sockets = parser.get("Context", "sockets", fallback="").split(";")
+            if "wayland" in sockets: self.chk_wayland.setChecked(True)
+            if "x11" in sockets or "fallback-x11" in sockets: self.chk_x11.setChecked(True)
+            if "pulseaudio" in sockets: self.chk_pulseaudio.setChecked(True)
+
+            devices = parser.get("Context", "devices", fallback="").split(";")
+            if "dri" in devices: self.chk_dri.setChecked(True)
+
+            filesystems = parser.get("Context", "filesystems", fallback="").split(";")
+            for fs in filesystems:
+                if not fs: continue
+                path = fs.split(":")[0]
+                if path == "home": binds_texts.append("~/")
+                elif path == "xdg-download": binds_texts.append("~/Downloads")
+                elif path == "xdg-pictures": binds_texts.append("~/Pictures")
+                elif path == "xdg-music": binds_texts.append("~/Music")
+                elif path == "xdg-videos": binds_texts.append("~/Videos")
+                elif path == "xdg-documents": binds_texts.append("~/Documents")
+                elif path == "host": binds_texts.append("/")
+                else: binds_texts.append(path)
+
+        if parser.has_section("Session Bus Policy"):
+            self.chk_dbus_user.setChecked(True)
+            for bus_name, policy in parser.items("Session Bus Policy"):
+                if policy == "talk": dbus_texts.append(f"--talk={bus_name}")
+                elif policy == "own": dbus_texts.append(f"--own={bus_name}")
+
+        self.edit_dbus.setPlainText("\n".join(dbus_texts))
+        self.edit_binds.setPlainText("\n".join(binds_texts))
+
+        self.status_label.setText("✅ Profile applied.")
+        QMessageBox.information(self, "Success", f"Metadata for {app_id} successfully parsed from Flathub!")
 
     def on_category_changed(self, index):
         self.package_model.removeRows(0, self.package_model.rowCount())
@@ -497,17 +707,51 @@ class SysextAdvancedGUI(QMainWindow):
         if not indexes: return
         menu = QMenu()
 
-        # Logika přepínání podle toho, jestli jsme zrovna v záložce Queue (index 4)
+        real_index = self.proxy_model.mapToSource(indexes[0])
+        name = self.package_model.item(real_index.row(), 0).text()
+        state = self.package_model.item(real_index.row(), 3).text()
+
         if self.category_list.currentRow() == 4:
             remove_action = QAction("❌ Remove from Queue", self)
             remove_action.triggered.connect(lambda: self.remove_selected_from_queue(indexes))
             menu.addAction(remove_action)
+        elif state == "Installed" or "Update Available" in state:
+            uninstall_action = QAction("🗑️ Uninstall Application", self)
+            uninstall_action.triggered.connect(lambda: self.uninstall_app(name))
+            menu.addAction(uninstall_action)
         else:
             add_action = QAction("🛒 Add to Transaction Queue", self)
             add_action.triggered.connect(lambda: self.add_selected_to_queue(indexes))
             menu.addAction(add_action)
 
         menu.exec(self.package_table.viewport().mapToGlobal(position))
+
+    def uninstall_app(self, app_name):
+        msg = f"Are you absolutely sure you want to completely obliterate '{app_name}'?\nThis will delete the application, its settings, and all sandbox data."
+        reply = QMessageBox.question(self, 'Confirmation', msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # 1. Remove the executable app
+                app_path = os.path.expanduser(f"~/.local/bin/{app_name}.app")
+                if os.path.exists(app_path): os.remove(app_path)
+
+                # 2. Obliterate sandbox and settings
+                var_path = os.path.expanduser(f"~/.var/app/{app_name}")
+                if os.path.isdir(var_path): shutil.rmtree(var_path)
+
+                # 3. Delete desktop entry
+                desktop_path = os.path.expanduser(f"~/.local/share/applications/{app_name}.desktop")
+                if os.path.exists(desktop_path): os.remove(desktop_path)
+
+                # 4. Refresh desktop database
+                subprocess.run(["update-desktop-database", os.path.expanduser("~/.local/share/applications")], capture_output=True)
+
+                self.status_label.setText(f"🔥 '{app_name}' has been completely removed.")
+                QMessageBox.information(self, "Uninstalled", f"Application '{app_name}' and its environment were successfully deleted.")
+                self.on_category_changed(self.category_list.currentRow())
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to uninstall application: {e}")
 
     def add_selected_to_queue(self, indexes):
         for index in indexes:
@@ -529,7 +773,6 @@ class SysextAdvancedGUI(QMainWindow):
             if name in self.transaction_queue:
                 self.transaction_queue.remove(name)
 
-        # Překreslení fronty
         self.package_model.removeRows(0, self.package_model.rowCount())
         self.show_queue()
         self.update_queue_ui()
@@ -552,13 +795,16 @@ class SysextAdvancedGUI(QMainWindow):
             self.btn_apply.setEnabled(False)
             self.category_list.setEnabled(False)
             self.combo_mode.setEnabled(False)
+            self.chk_merge_queue.setEnabled(False)
 
             selected_mode = "Host-Native" if "Host-Native" in self.combo_mode.currentText() else "Portable"
+            merge_queue = self.chk_merge_queue.isChecked()
+
             self.status_label.setText(f"⚙️ Building in progress ({selected_mode})... Please wait.")
             self.details_tabs.setCurrentIndex(0)
             self.tab_info.setHtml("<h3>Build Log</h3>")
 
-            self.build_worker = BuildAsyncWorker(self.transaction_queue.copy(), selected_mode)
+            self.build_worker = BuildAsyncWorker(self.transaction_queue.copy(), selected_mode, merge_queue)
             self.build_worker.log_msg.connect(self.append_build_log)
             self.build_worker.finished_all.connect(self.on_build_finished)
             self.build_worker.error.connect(self.on_build_error)
@@ -576,6 +822,7 @@ class SysextAdvancedGUI(QMainWindow):
         self.update_queue_ui()
         self.category_list.setEnabled(True)
         self.combo_mode.setEnabled(True)
+        self.chk_merge_queue.setEnabled(True)
         self.on_category_changed(self.category_list.currentRow())
 
     def on_build_error(self, error_message):
@@ -583,6 +830,7 @@ class SysextAdvancedGUI(QMainWindow):
         QMessageBox.critical(self, "Build Error", error_message)
         self.category_list.setEnabled(True)
         self.combo_mode.setEnabled(True)
+        self.chk_merge_queue.setEnabled(True)
         self.update_queue_ui()
 
     def closeEvent(self, event):
