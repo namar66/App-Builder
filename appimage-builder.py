@@ -177,98 +177,225 @@ int main(int argc, char *argv[]) {{
 
     usleep(250000);
 
+    char *home = getenv("HOME");
+    if (!home) home = "/";
+
+    char private_home[2048], mkdir_cmd[2048], flags_file[2048];
+    snprintf(private_home, sizeof(private_home), "%s/.var/app/%s", home, "{app_name}");
+    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", private_home);
+    system(mkdir_cmd);
+    snprintf(flags_file, sizeof(flags_file), "%s/flags.txt", private_home);
+
+    int disable_sandbox = 0;
+    FILE *ff_init = fopen(flags_file, "r");
+    if (ff_init) {{
+        char line[2048];
+        while (fgets(line, sizeof(line), ff_init)) {{
+            line[strcspn(line, "\\n")] = 0;
+            if (strcmp(line, "DISABLE_SANDBOX") == 0) disable_sandbox = 1;
+        }}
+        fclose(ff_init);
+    }}
+
+    // --- SECURITY FIX: XDG-DBUS-PROXY INITIALIZATION ---
+    pid_t dbus_proxy_pid = 0;
+    char dbus_proxy_dir[] = "/tmp/dbusproxy.XXXXXX";
+    char proxy_socket_src[2048] = "";
+
+    char dbus_session_file[2048];
+    snprintf(dbus_session_file, sizeof(dbus_session_file), "%s/dbus-session.txt", private_home);
+
+    FILE *dbus_f = fopen(dbus_session_file, "r");
+    if (dbus_f) {{
+        int allow_all = 0;
+        char line[2048];
+        while (fgets(line, sizeof(line), dbus_f)) {{
+            line[strcspn(line, "\\n")] = 0;
+            if (strcmp(line, "ALLOW_ALL") == 0) allow_all = 1;
+        }}
+        rewind(dbus_f);
+
+        if (allow_all || disable_sandbox) {{
+            // Map the real host D-Bus directly
+            snprintf(proxy_socket_src, sizeof(proxy_socket_src), "/run/user/%d/bus", getuid());
+        }} else {{
+            if (mkdtemp(dbus_proxy_dir) != NULL) {{
+                snprintf(proxy_socket_src, sizeof(proxy_socket_src), "%s/bus", dbus_proxy_dir);
+                dbus_proxy_pid = fork();
+                if (dbus_proxy_pid == 0) {{
+                    // Child: Start proxy server
+                    int dev_null = open("/dev/null", O_WRONLY);
+                    if (dev_null != -1) {{ dup2(dev_null, 1); dup2(dev_null, 2); close(dev_null); }}
+                    char *proxy_args[1024]; int pa_idx = 0;
+                    proxy_args[pa_idx++] = "xdg-dbus-proxy";
+                    char real_bus[1024]; snprintf(real_bus, sizeof(real_bus), "unix:path=/run/user/%d/bus", getuid());
+                    proxy_args[pa_idx++] = real_bus;
+                    proxy_args[pa_idx++] = proxy_socket_src;
+                    proxy_args[pa_idx++] = "--filter"; // Block everything by default
+
+                    // --- FIX: Always allow XDG Desktop Portals ---
+                    proxy_args[pa_idx++] = "--talk=org.freedesktop.portal.*";
+
+                    while (fgets(line, sizeof(line), dbus_f)) {{
+                        line[strcspn(line, "\\n")] = 0;
+                        if (strlen(line) > 0 && strcmp(line, "ALLOW_ALL") != 0) proxy_args[pa_idx++] = strdup(line);
+                    }}
+                    proxy_args[pa_idx] = NULL;
+                    execvp(proxy_args[0], proxy_args);
+                    exit(1);
+                }}
+                usleep(150000);
+            }}
+        }}
+        fclose(dbus_f);
+    }}
+
     pid_t app_pid = fork();
     if (app_pid == 0) {{
-        char path_env[2048], ld_env[2048], xdg_env[2048], entrypoint_path[2048];
-        char opt_bind_src[2048], libgl_env[2048], private_home[2048], mkdir_cmd[2048];
+        char approot_dir[1024];
+        snprintf(approot_dir, sizeof(approot_dir), "/run/user/%d/approot", getuid());
 
-        snprintf(path_env, sizeof(path_env), "/opt/approot/usr/bin:/usr/bin:/bin");
-        snprintf(ld_env, sizeof(ld_env), "/opt/approot/usr/lib64:/lib:/lib/pulseaudio:/lib/alsa-lib:/usr/lib64");
-        snprintf(xdg_env, sizeof(xdg_env), "/opt/approot/usr/share:/usr/share");
-        snprintf(entrypoint_path, sizeof(entrypoint_path), "/opt/approot%s", "{entrypoint_suffix}");
-        snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
-        snprintf(libgl_env, sizeof(libgl_env), "/opt/approot/usr/lib64/dri:/lib/dri:/usr/lib64/dri");
-
-        char *home = getenv("HOME");
-        if (!home) home = "/";
-
-        snprintf(private_home, sizeof(private_home), "%s/.var/app/%s", home, "{app_name}");
-        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", private_home);
-        system(mkdir_cmd);
+        char path_env[2048], ld_env[2048], xdg_env[2048], entrypoint_path[2048], libgl_env[2048];
+        snprintf(path_env, sizeof(path_env), "%s/usr/bin:/usr/bin:/bin", approot_dir);
+        snprintf(ld_env, sizeof(ld_env), "%s/usr/lib64:/lib:/lib/pulseaudio:/lib/alsa-lib:/usr/lib64", approot_dir);
+        snprintf(xdg_env, sizeof(xdg_env), "%s/usr/share:/usr/share", approot_dir);
+        snprintf(entrypoint_path, sizeof(entrypoint_path), "%s%s", approot_dir, "{entrypoint_suffix}");
+        snprintf(libgl_env, sizeof(libgl_env), "%s/usr/lib64/dri:/lib/dri:/usr/lib64/dri", approot_dir);
 
         char *b_args[1024]; int arg_idx = 0;
         b_args[arg_idx++] = "bwrap";
-        b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/usr"; b_args[arg_idx++] = "/usr";
-        b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/etc"; b_args[arg_idx++] = "/etc";
-        b_args[arg_idx++] = "--dev-bind"; b_args[arg_idx++] = "/dev"; b_args[arg_idx++] = "/dev";
-        b_args[arg_idx++] = "--proc"; b_args[arg_idx++] = "/proc";
-        b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/sys"; b_args[arg_idx++] = "/sys";
-        b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = "/tmp"; b_args[arg_idx++] = "/tmp";
-        b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/run";
-        b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = "/run/user"; b_args[arg_idx++] = "/run/user";
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = "/run/dbus"; b_args[arg_idx++] = "/run/dbus";
 
-        b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = private_home; b_args[arg_idx++] = home;
+        if (disable_sandbox) {{
+            b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = "/"; b_args[arg_idx++] = "/";
+            b_args[arg_idx++] = "--dev-bind"; b_args[arg_idx++] = "/dev"; b_args[arg_idx++] = "/dev";
 
-        char host_icons[2048], host_local_icons[2048], kde_config[2048], font_config[2048];
-        snprintf(host_icons, sizeof(host_icons), "%s/.icons", home);
-        snprintf(host_local_icons, sizeof(host_local_icons), "%s/.local/share/icons", home);
-        snprintf(kde_config, sizeof(kde_config), "%s/.config/kdeglobals", home);
-        snprintf(font_config, sizeof(font_config), "%s/.config/fontconfig", home);
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = approot_dir;
+            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = mount_point; b_args[arg_idx++] = approot_dir;
 
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_icons; b_args[arg_idx++] = host_icons;
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_local_icons; b_args[arg_idx++] = host_local_icons;
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = kde_config; b_args[arg_idx++] = kde_config;
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = font_config; b_args[arg_idx++] = font_config;
+            char opt_bind_src[2048]; snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
+            char opt_bind_dst[2048]; snprintf(opt_bind_dst, sizeof(opt_bind_dst), "%s/opt", approot_dir);
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = opt_bind_src; b_args[arg_idx++] = strdup(opt_bind_dst);
 
-        char binds_file[2048]; snprintf(binds_file, sizeof(binds_file), "%s/binds.txt", private_home);
-        FILE *touch_bf = fopen(binds_file, "a"); if(touch_bf) fclose(touch_bf);
-        FILE *bf = fopen(binds_file, "r");
-        if (bf) {{
-            char line[2048];
-            while (fgets(line, sizeof(line), bf)) {{
-                line[strcspn(line, "\\n")] = 0;
-                if (strlen(line) > 0) {{ b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = strdup(line); b_args[arg_idx++] = strdup(line); }}
+            char app_lib[2048]; snprintf(app_lib, sizeof(app_lib), "%s/usr/lib", mount_point);
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = app_lib; b_args[arg_idx++] = "/lib";
+        }} else {{
+            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/usr"; b_args[arg_idx++] = "/usr";
+            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/etc"; b_args[arg_idx++] = "/etc";
+            b_args[arg_idx++] = "--dev-bind"; b_args[arg_idx++] = "/dev"; b_args[arg_idx++] = "/dev";
+            b_args[arg_idx++] = "--proc"; b_args[arg_idx++] = "/proc";
+            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = "/sys"; b_args[arg_idx++] = "/sys";
+            b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = "/tmp";
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/run";
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/run/user";
+
+            char run_user_dir[1024];
+            snprintf(run_user_dir, sizeof(run_user_dir), "/run/user/%d", getuid());
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = strdup(run_user_dir);
+
+            // --- FIX: Mount XDG Document Portal for seamless file sharing ---
+            char doc_portal[1024];
+            snprintf(doc_portal, sizeof(doc_portal), "/run/user/%d/doc", getuid());
+            b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = strdup(doc_portal); b_args[arg_idx++] = strdup(doc_portal);
+
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = "/run/systemd/resolve"; b_args[arg_idx++] = "/run/systemd/resolve";
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = "/run/NetworkManager"; b_args[arg_idx++] = "/run/NetworkManager";
+
+            b_args[arg_idx++] = "--bind"; b_args[arg_idx++] = private_home; b_args[arg_idx++] = home;
+
+            // --- SECURITY FIX: LOCK DOWN SANDBOX CONFIGS ---
+            const char *config_files[] = {{"binds.txt", "masks.txt", "flags.txt", "dbus-session.txt", "deps.txt"}};
+            for (int j = 0; j < 5; j++) {{
+                char cf_src[2048], cf_dest[2048];
+                snprintf(cf_src, sizeof(cf_src), "%s/%s", private_home, config_files[j]);
+                snprintf(cf_dest, sizeof(cf_dest), "%s/%s", home, config_files[j]);
+                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(cf_src); b_args[arg_idx++] = strdup(cf_dest);
             }}
-            fclose(bf);
-        }}
 
-        char masks_file[2048]; snprintf(masks_file, sizeof(masks_file), "%s/masks.txt", private_home);
-        FILE *touch_mf = fopen(masks_file, "a"); if(touch_mf) fclose(touch_mf);
-        FILE *mf = fopen(masks_file, "r");
-        if (mf) {{
-            char line[2048];
-            while (fgets(line, sizeof(line), mf)) {{
-                line[strcspn(line, "\\n")] = 0;
-                if (strlen(line) > 0) {{ b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = strdup(line); }}
+            if (strlen(proxy_socket_src) > 0) {{
+                char proxy_socket_dest[1024];
+                snprintf(proxy_socket_dest, sizeof(proxy_socket_dest), "/run/user/%d/bus", getuid());
+                b_args[arg_idx++] = "--ro-bind";
+                b_args[arg_idx++] = strdup(proxy_socket_src);
+                b_args[arg_idx++] = strdup(proxy_socket_dest);
+
+                char env_dbus[1024];
+                snprintf(env_dbus, sizeof(env_dbus), "unix:path=%s", proxy_socket_dest);
+                b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "DBUS_SESSION_BUS_ADDRESS"; b_args[arg_idx++] = strdup(env_dbus);
             }}
-            fclose(mf);
+
+            FILE *ff = fopen(flags_file, "r");
+            if (ff) {{
+                char line[2048];
+                while (fgets(line, sizeof(line), ff)) {{
+                    line[strcspn(line, "\\n")] = 0;
+                    if (strlen(line) > 0 && strcmp(line, "DISABLE_SANDBOX") != 0) {{ b_args[arg_idx++] = strdup(line); }}
+                }}
+                fclose(ff);
+            }}
+
+            char host_icons[2048], host_local_icons[2048], kde_config[2048], font_config[2048];
+            snprintf(host_icons, sizeof(host_icons), "%s/.icons", home);
+            snprintf(host_local_icons, sizeof(host_local_icons), "%s/.local/share/icons", home);
+            snprintf(kde_config, sizeof(kde_config), "%s/.config/kdeglobals", home);
+            snprintf(font_config, sizeof(font_config), "%s/.config/fontconfig", home);
+
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_icons; b_args[arg_idx++] = host_icons;
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = host_local_icons; b_args[arg_idx++] = host_local_icons;
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = kde_config; b_args[arg_idx++] = kde_config;
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = font_config; b_args[arg_idx++] = font_config;
+
+            char binds_file[2048]; snprintf(binds_file, sizeof(binds_file), "%s/binds.txt", private_home);
+            FILE *touch_bf = fopen(binds_file, "a"); if(touch_bf) fclose(touch_bf);
+            FILE *bf = fopen(binds_file, "r");
+            if (bf) {{
+                char line[2048];
+                while (fgets(line, sizeof(line), bf)) {{
+                    line[strcspn(line, "\\n")] = 0;
+                    if (strlen(line) > 0) {{ b_args[arg_idx++] = "--bind-try"; b_args[arg_idx++] = strdup(line); b_args[arg_idx++] = strdup(line); }}
+                }}
+                fclose(bf);
+            }}
+
+            char masks_file[2048]; snprintf(masks_file, sizeof(masks_file), "%s/masks.txt", private_home);
+            FILE *touch_mf = fopen(masks_file, "a"); if(touch_mf) fclose(touch_mf);
+            FILE *mf = fopen(masks_file, "r");
+            if (mf) {{
+                char line[2048];
+                while (fgets(line, sizeof(line), mf)) {{
+                    line[strcspn(line, "\\n")] = 0;
+                    if (strlen(line) > 0) {{ b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = strdup(line); }}
+                }}
+                fclose(mf);
+            }}
+
+            const char *sensitive_paths[] = {{".bashrc", ".bash_profile", ".bash_logout", ".profile", ".zshrc", ".ssh", ".config/autostart"}};
+            for (int j = 0; j < 7; j++) {{
+                char sp1[2048], sp2[2048];
+                snprintf(sp1, sizeof(sp1), "%s/%s", home, sensitive_paths[j]);
+                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp1); b_args[arg_idx++] = strdup(sp1);
+                snprintf(sp2, sizeof(sp2), "%s/%s", private_home, sensitive_paths[j]);
+                b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp2); b_args[arg_idx++] = strdup(sp2);
+            }}
+
+            b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = "/etc/ssl";
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/etc/ssl/certs";
+            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-certificates.crt";
+            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-bundle.crt";
+
+            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/bin"; b_args[arg_idx++] = "/bin";
+            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/sbin"; b_args[arg_idx++] = "/sbin";
+            b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/lib64"; b_args[arg_idx++] = "/lib64";
+
+            b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = approot_dir;
+            b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = mount_point; b_args[arg_idx++] = approot_dir;
+
+            char opt_bind_src[2048]; snprintf(opt_bind_src, sizeof(opt_bind_src), "%s/opt", mount_point);
+            char opt_bind_dst[2048]; snprintf(opt_bind_dst, sizeof(opt_bind_dst), "%s/opt", approot_dir);
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = opt_bind_src; b_args[arg_idx++] = strdup(opt_bind_dst);
+
+            char app_lib[2048]; snprintf(app_lib, sizeof(app_lib), "%s/usr/lib", mount_point);
+            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = app_lib; b_args[arg_idx++] = "/lib";
         }}
-
-        const char *sensitive_paths[] = {{".bashrc", ".bash_profile", ".bash_logout", ".profile", ".zshrc", ".ssh", ".config/autostart"}};
-        for (int j = 0; j < 7; j++) {{
-            char sp1[2048], sp2[2048];
-            snprintf(sp1, sizeof(sp1), "%s/%s", home, sensitive_paths[j]);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp1); b_args[arg_idx++] = strdup(sp1);
-            snprintf(sp2, sizeof(sp2), "%s/%s", private_home, sensitive_paths[j]);
-            b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = strdup(sp2); b_args[arg_idx++] = strdup(sp2);
-        }}
-
-        b_args[arg_idx++] = "--tmpfs"; b_args[arg_idx++] = "/etc/ssl";
-        b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/etc/ssl/certs";
-        b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-certificates.crt";
-        b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "/etc/pki/tls/certs/ca-bundle.crt"; b_args[arg_idx++] = "/etc/ssl/certs/ca-bundle.crt";
-
-        b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/bin"; b_args[arg_idx++] = "/bin";
-        b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/sbin"; b_args[arg_idx++] = "/sbin";
-        b_args[arg_idx++] = "--symlink"; b_args[arg_idx++] = "usr/lib64"; b_args[arg_idx++] = "/lib64";
-
-        b_args[arg_idx++] = "--ro-bind"; b_args[arg_idx++] = mount_point; b_args[arg_idx++] = "/opt/approot";
-        b_args[arg_idx++] = "--dir"; b_args[arg_idx++] = "/opt";
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = opt_bind_src; b_args[arg_idx++] = "/opt/approot/opt";
-
-        char app_lib[2048]; snprintf(app_lib, sizeof(app_lib), "%s/usr/lib", mount_point);
-        b_args[arg_idx++] = "--ro-bind-try"; b_args[arg_idx++] = app_lib; b_args[arg_idx++] = "/lib";
 
         b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "PATH"; b_args[arg_idx++] = path_env;
         b_args[arg_idx++] = "--setenv"; b_args[arg_idx++] = "LD_LIBRARY_PATH"; b_args[arg_idx++] = ld_env;
@@ -280,6 +407,9 @@ int main(int argc, char *argv[]) {{
 
         b_args[arg_idx++] = entrypoint_path;
         if (strstr(entrypoint_path, "steam") != NULL) b_args[arg_idx++] = "-no-cef-sandbox";
+        if (strstr(entrypoint_path, "chromium") != NULL || strstr(entrypoint_path, "chrome") != NULL || strstr(entrypoint_path, "brave") != NULL) {{
+            b_args[arg_idx++] = "--no-sandbox";
+        }}
 
         for (int i = 1; i < argc && arg_idx < 1023; i++) b_args[arg_idx++] = argv[i];
         b_args[arg_idx] = NULL;
@@ -290,6 +420,13 @@ int main(int argc, char *argv[]) {{
 
     int status;
     waitpid(app_pid, &status, 0);
+
+    if (dbus_proxy_pid > 0) {{
+        kill(dbus_proxy_pid, SIGTERM);
+        waitpid(dbus_proxy_pid, NULL, 0);
+        unlink(proxy_socket_src);
+        rmdir(dbus_proxy_dir);
+    }}
 
     pid_t umount_pid = fork();
     if (umount_pid == 0) {{
@@ -428,6 +565,23 @@ def main():
 
         app_version = "unknown"
         logging.info("Detecting package version...")
+
+        # --- NEW: Generate dependency list (deps.txt) ---
+        deps_list = []
+        logging.info("Generating dependency manifest...")
+        for rpm in rpms_to_extract:
+            # Extract exact package name and version from RPM
+            res = subprocess.run(["rpm", "-qp", "--queryformat", "%{NAME}-%{VERSION}-%{RELEASE}", rpm], capture_output=True, text=True, errors="replace")
+            if res.returncode == 0:
+                deps_list.append(res.stdout.strip())
+
+        # Save deps.txt directly to ~/.var/app/<app_name>/
+        app_private_home = os.path.expanduser(f"~/.var/app/{name}")
+        os.makedirs(app_private_home, exist_ok=True)
+        with open(os.path.join(app_private_home, "deps.txt"), "w") as f:
+            f.write("\n".join(sorted(deps_list)))
+        # --------------------------------------------------------
+
         for rpm in rpms_to_extract:
             if name.lower() in os.path.basename(rpm).lower():
                 res = subprocess.run(["rpm", "-qp", "--queryformat", "%{VERSION}-%{RELEASE}", rpm], capture_output=True, text=True, errors="replace")
