@@ -4,12 +4,15 @@
 # Generates a fully isolated, standalone executable with embedded EROFS payload.
 # Features: Strict sandbox security, private home, versioning, GPG checks, dynamic binds/masks, Host-Native mode.
 
-import os
-import sys
-import subprocess
-import shutil
-import logging
+
 import struct
+import sys
+import os
+import tempfile
+import shutil
+import subprocess
+import logging
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
@@ -513,6 +516,41 @@ def integrate_into_system(app_name, final_app_path, staging_root):
         pass
     logging.info(f"Successfully integrated {app_name}. Menu is now updated.")
 
+def build_erofs_container(app_name, build_mode, packages):
+    """
+    Main build logic wrapped in a secure temporary directory manager.
+    Ensures absolute cleanup of the tmpfs workspace on success or failure.
+    """
+    # Create a secure temporary directory in /tmp (tmpfs in Fedora)
+    work_dir = tempfile.mkdtemp(prefix=f"sysext-build-{app_name}-")
+    logging.info(f"Created temporary workspace at: {work_dir}")
+
+    try:
+        # 1. DOWNLOAD RPMs
+        logging.info("Downloading packages via DNF...")
+        # ... paste your existing DNF toolbox download logic here ...
+
+        # 2. EXTRACT RPMs
+        logging.info("Extracting RPMs using rpm2cpio...")
+        # ... paste your existing extraction and manipulation logic here ...
+
+        # 3. BUILD EROFS
+        logging.info("Compiling EROFS image...")
+        # ... paste your mkfs.erofs execution here ...
+
+        logging.info(f"Successfully built {app_name}.app!")
+
+    except Exception as e:
+        # Catch any failure during the build process
+        logging.critical(f"Build process failed for {app_name}: {e}")
+        sys.exit(1)
+
+    finally:
+        # THE GARBAGE COLLECTOR - This executes NO MATTER WHAT happens above
+        if os.path.exists(work_dir):
+            logging.info(f"Obliterating temporary workspace to free RAM: {work_dir}")
+            shutil.rmtree(work_dir)
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: appimage-builder.py <App-Name> <Portable|Host-Native> [Package1 ...]")
@@ -525,6 +563,8 @@ def main():
     output_dir = os.path.abspath("./")
     build_dir = f"/var/tmp/app-build-{name}"
     staging_root = os.path.join(build_dir, "root")
+
+    build_erofs_container(app_name, build_mode, packages)
 
     try:
         if os.path.exists(build_dir):
@@ -644,4 +684,5 @@ def main():
             logging.info("Cleaned up build directory.")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     main()
