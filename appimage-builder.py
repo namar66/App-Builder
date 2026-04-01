@@ -116,7 +116,7 @@ def detect_entrypoint(staging_root, app_name):
     return "/usr/bin/bash"
 
 def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, app_mode):
-    logging.info(f"Generating high-performance C wrapper for {app_name}...")
+    logging.info(f"Generating advanced FUSE C wrapper (SteamWebHelper fix) for {app_name}...")
 
     wrapper_c_path = os.path.join(source_path, f"{app_name}_wrapper.c")
     wrapper_bin_path = os.path.join(source_path, app_name)
@@ -129,8 +129,11 @@ def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, ap
     #include <limits.h>
     #include <pwd.h>
     #include <sys/types.h>
+    #include <sys/wait.h>
+    #include <stdint.h>
+    #include <sys/stat.h>
 
-    #define MAX_ARGS 1024
+    #define MAX_ARGS 2048
 
     int main(int argc, char *argv[]) {{
         char *args[MAX_ARGS];
@@ -142,40 +145,56 @@ def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, ap
             }}
         }}
 
-        add_arg("bwrap");
-
-        // --- Base isolated filesystem mounts ---
-        add_arg("--ro-bind"); add_arg("/usr"); add_arg("/usr");
-        add_arg("--symlink"); add_arg("usr/lib"); add_arg("/lib");
-        add_arg("--symlink"); add_arg("usr/lib64"); add_arg("/lib64");
-        add_arg("--symlink"); add_arg("usr/bin"); add_arg("/bin");
-        add_arg("--symlink"); add_arg("usr/sbin"); add_arg("/sbin");
-        add_arg("--dev"); add_arg("/dev");
-        add_arg("--proc"); add_arg("/proc");
-        add_arg("--ro-bind"); add_arg("/etc/resolv.conf"); add_arg("/etc/resolv.conf");
-
-        // Essential GUI configs (Fonts, Icons, Themes)
-        add_arg("--ro-bind-try"); add_arg("/etc/fonts"); add_arg("/etc/fonts");
-        add_arg("--ro-bind-try"); add_arg("/usr/share/fonts"); add_arg("/usr/share/fonts");
-        add_arg("--ro-bind-try"); add_arg("/usr/share/icons"); add_arg("/usr/share/icons");
-        add_arg("--ro-bind-try"); add_arg("/usr/share/themes"); add_arg("/usr/share/themes");
-
-        // Pass essential Environment Variables for Display
-        if (getenv("WAYLAND_DISPLAY")) {{
-            add_arg("--setenv"); add_arg("WAYLAND_DISPLAY"); add_arg(getenv("WAYLAND_DISPLAY"));
+        // 1. Zjistíme naši cestu
+        char app_path[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", app_path, sizeof(app_path)-1);
+        if (len == -1) {{
+            perror("NYX ERROR: readlink failed"); return 1;
         }}
-        if (getenv("DISPLAY")) {{
-            add_arg("--setenv"); add_arg("DISPLAY"); add_arg(getenv("DISPLAY"));
-        }}
-        if (getenv("XDG_RUNTIME_DIR")) {{
-            add_arg("--ro-bind-try"); add_arg(getenv("XDG_RUNTIME_DIR")); add_arg(getenv("XDG_RUNTIME_DIR"));
-            add_arg("--setenv"); add_arg("XDG_RUNTIME_DIR"); add_arg(getenv("XDG_RUNTIME_DIR"));
-        }}
-        if (getenv("XAUTHORITY")) {{
-            add_arg("--ro-bind-try"); add_arg(getenv("XAUTHORITY")); add_arg(getenv("XAUTHORITY"));
-            add_arg("--setenv"); add_arg("XAUTHORITY"); add_arg(getenv("XAUTHORITY"));
+        app_path[len] = '\\0';
+
+        // 2. Extrakce EROFS offsetu
+        uint64_t erofs_offset = 0;
+        uint32_t magic = 0;
+        FILE *f = fopen(app_path, "rb");
+        if (f) {{
+            fseek(f, -12, SEEK_END);
+            if (fread(&erofs_offset, 1, 8, f) != 8) {{ fclose(f); return 1; }}
+            if (fread(&magic, 1, 4, f) != 4) {{ fclose(f); return 1; }}
+            fclose(f);
         }}
 
+        if (magic != 0x41505049) {{
+            fprintf(stderr, "NYX FATAL: Magic footer not found. Payload is missing!\\n");
+            return 1;
+        }}
+
+        // 3. FUSE mountpoint v RAM
+        char mount_dir[] = "/tmp/.nyx_app_XXXXXX";
+        if (!mkdtemp(mount_dir)) {{
+            perror("NYX ERROR: mkdtemp failed"); return 1;
+        }}
+
+        char offset_str[64];
+        snprintf(offset_str, sizeof(offset_str), "--offset=%llu", (unsigned long long)erofs_offset);
+
+        pid_t fuse_pid = fork();
+        if (fuse_pid == 0) {{
+            execlp("erofsfuse", "erofsfuse", offset_str, app_path, mount_dir, NULL);
+            fprintf(stderr, "NYX FATAL: erofsfuse failed to execute.\\n");
+            exit(1);
+        }}
+
+        int fuse_status;
+        waitpid(fuse_pid, &fuse_status, 0);
+        if (WEXITSTATUS(fuse_status) != 0) {{
+            fprintf(stderr, "NYX FATAL: Failed to mount EROFS payload.\\n");
+            rmdir(mount_dir);
+            return 1;
+        }}
+        usleep(150000);
+
+        // 4. Domovské adresáře a Private Home
         char home_dir[PATH_MAX];
         struct passwd *pw = getpwuid(getuid());
         if (pw) {{
@@ -184,102 +203,191 @@ def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, ap
             strncpy(home_dir, getenv("HOME"), sizeof(home_dir) - 1);
         }}
 
-        // --- Parse metadata INI file ---
+        char app_dir[PATH_MAX];
+        snprintf(app_dir, sizeof(app_dir), "%s/.var/app/{app_name}", home_dir);
+        char private_home[PATH_MAX];
+        snprintf(private_home, sizeof(private_home), "%s/home", app_dir);
+
+        char mkdir_cmd[PATH_MAX + 128];
+        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \\"%s\\"", private_home);
+        system(mkdir_cmd);
+
         char metadata_path[PATH_MAX];
-        snprintf(metadata_path, sizeof(metadata_path), "%s/.var/app/{app_name}/metadata", home_dir);
+        snprintf(metadata_path, sizeof(metadata_path), "%s/metadata", app_dir);
 
         int no_sandbox = 0;
-        FILE *meta_file = fopen(metadata_path, "r");
+        FILE *meta_check = fopen(metadata_path, "r");
+        if (meta_check) {{
+            char line[1024];
+            while (fgets(line, sizeof(line), meta_check)) {{
+                if (strstr(line, "nosandbox=true")) no_sandbox = 1;
+            }}
+            fclose(meta_check);
+        }}
 
+        // 5. Build bwrap argumentů
+        add_arg("bwrap");
+
+        if (no_sandbox) {{
+            add_arg("--bind"); add_arg("/"); add_arg("/");
+            add_arg("--dev-bind"); add_arg("/dev"); add_arg("/dev");
+            add_arg("--proc"); add_arg("/proc");
+            add_arg("--bind-try"); add_arg("/sys"); add_arg("/sys");
+        }} else {{
+            add_arg("--bind"); add_arg(private_home); add_arg(home_dir);
+
+            if (strncmp(home_dir, "/var/home", 9) == 0) {{
+                add_arg("--symlink"); add_arg("var/home"); add_arg("/home");
+            }}
+
+            add_arg("--tmpfs"); add_arg("/tmp");
+            add_arg("--bind-try"); add_arg("/tmp/.X11-unix"); add_arg("/tmp/.X11-unix");
+            add_arg("--bind-try"); add_arg("/var/tmp"); add_arg("/var/tmp");
+            add_arg("--bind-try"); add_arg("/dev/shm"); add_arg("/dev/shm");
+
+            add_arg("--ro-bind"); add_arg("/usr"); add_arg("/usr");
+
+            // Kinoite 32-bit fix
+            char payload_usr_lib[PATH_MAX];
+            snprintf(payload_usr_lib, sizeof(payload_usr_lib), "%s/usr/lib", mount_dir);
+            add_arg("--ro-bind-try"); add_arg(payload_usr_lib); add_arg("/usr/lib");
+
+            add_arg("--symlink"); add_arg("usr/lib"); add_arg("/lib");
+            add_arg("--symlink"); add_arg("usr/lib64"); add_arg("/lib64");
+            add_arg("--symlink"); add_arg("usr/bin"); add_arg("/bin");
+            add_arg("--symlink"); add_arg("usr/sbin"); add_arg("/sbin");
+
+            add_arg("--dev-bind"); add_arg("/dev"); add_arg("/dev");
+            add_arg("--proc"); add_arg("/proc");
+            add_arg("--ro-bind-try"); add_arg("/sys"); add_arg("/sys");
+
+            add_arg("--ro-bind-try"); add_arg("/etc/os-release"); add_arg("/etc/os-release");
+            add_arg("--ro-bind-try"); add_arg("/etc/resolv.conf"); add_arg("/etc/resolv.conf");
+            add_arg("--ro-bind-try"); add_arg("/etc/machine-id"); add_arg("/etc/machine-id");
+            add_arg("--ro-bind-try"); add_arg("/etc/passwd"); add_arg("/etc/passwd");
+            add_arg("--ro-bind-try"); add_arg("/etc/group"); add_arg("/etc/group");
+
+            // --- PRESSURE VESSEL / STEAMWEBHELPER FIX ---
+            add_arg("--ro-bind-try"); add_arg("/etc/ld.so.cache"); add_arg("/etc/ld.so.cache");
+            add_arg("--dir"); add_arg("/var/cache/ldconfig"); // Vyrobíme Ubuntu složku
+            add_arg("--symlink"); add_arg("/etc/ld.so.cache"); add_arg("/var/cache/ldconfig/ld.so.cache"); // Lžeme Steamu
+            // --------------------------------------------
+
+            add_arg("--ro-bind-try"); add_arg("/etc/ssl"); add_arg("/etc/ssl");
+            add_arg("--ro-bind-try"); add_arg("/etc/pki"); add_arg("/etc/pki");
+            add_arg("--ro-bind-try"); add_arg("/usr/share/ca-certificates"); add_arg("/usr/share/ca-certificates");
+
+            add_arg("--ro-bind-try"); add_arg("/etc/fonts"); add_arg("/etc/fonts");
+            add_arg("--ro-bind-try"); add_arg("/usr/share/fonts"); add_arg("/usr/share/fonts");
+            add_arg("--ro-bind-try"); add_arg("/usr/share/icons"); add_arg("/usr/share/icons");
+            add_arg("--ro-bind-try"); add_arg("/usr/share/themes"); add_arg("/usr/share/themes");
+            add_arg("--ro-bind-try"); add_arg("/usr/share/i18n"); add_arg("/usr/share/i18n");
+        }}
+
+        // Aplikaci izolujeme do /nyx
+        add_arg("--ro-bind"); add_arg(mount_dir); add_arg("/nyx");
+
+        add_arg("--setenv"); add_arg("PATH"); add_arg("/nyx/usr/bin:/nyx/usr/sbin:/usr/bin:/usr/sbin");
+        add_arg("--setenv"); add_arg("LD_LIBRARY_PATH"); add_arg("/nyx/usr/lib:/nyx/usr/lib64:/usr/lib64:/lib64");
+        add_arg("--setenv"); add_arg("XDG_DATA_DIRS"); add_arg("/nyx/usr/share:/usr/share");
+
+        if (getenv("WAYLAND_DISPLAY")) {{ add_arg("--setenv"); add_arg("WAYLAND_DISPLAY"); add_arg(getenv("WAYLAND_DISPLAY")); }}
+        if (getenv("DISPLAY")) {{ add_arg("--setenv"); add_arg("DISPLAY"); add_arg(getenv("DISPLAY")); }}
+        if (getenv("XDG_RUNTIME_DIR")) {{
+            add_arg("--setenv"); add_arg("XDG_RUNTIME_DIR"); add_arg(getenv("XDG_RUNTIME_DIR"));
+            if (!no_sandbox) {{ add_arg("--bind-try"); add_arg(getenv("XDG_RUNTIME_DIR")); add_arg(getenv("XDG_RUNTIME_DIR")); }}
+        }}
+
+        // Metadata Binds
+        FILE *meta_file = fopen(metadata_path, "r");
         if (meta_file) {{
             char line[1024];
             char current_section[64] = "";
-
             while (fgets(line, sizeof(line), meta_file)) {{
                 line[strcspn(line, "\\r\\n")] = 0;
-                if (line[0] == '[') {{
-                    sscanf(line, "[%63[^]]]", current_section);
-                    continue;
-                }}
+                if (line[0] == '[') {{ sscanf(line, "[%63[^]]]", current_section); continue; }}
 
                 char *eq = strchr(line, '=');
                 if (!eq) continue;
-                *eq = '\\0';
-                char *key = line;
-                char *val = eq + 1;
+                *eq = '\\0'; char *key = line; char *val = eq + 1;
 
-                if (strcmp(current_section, \"Context\") == 0) {{
-                    if (strstr(key, \"filesystems\")) {{
-                        char *token = strtok(val, \";\");
-                        while (token) {{
-                            if (strlen(token) > 0) {{
-                                char resolved_path[PATH_MAX];
-                                if (strncmp(token, \"~/\", 2) == 0) {{
-                                    snprintf(resolved_path, sizeof(resolved_path), \"%s/%s\", home_dir, token + 2);
-                                }} else {{
-                                    strncpy(resolved_path, token, sizeof(resolved_path) - 1);
-                                }}
-                                add_arg(\"--bind\"); add_arg(resolved_path); add_arg(resolved_path);
-                            }}
-                            token = strtok(NULL, \";\");
+                if (strcmp(current_section, "Context") == 0 && strstr(key, "filesystems")) {{
+                    char *token = strtok(val, ";");
+                    while (token) {{
+                        if (strlen(token) > 0) {{
+                            char resolved[PATH_MAX];
+                            if (strncmp(token, "home", 4) == 0) snprintf(resolved, PATH_MAX, "%s", home_dir);
+                            else if (strncmp(token, "xdg-config", 10) == 0) snprintf(resolved, PATH_MAX, "%s/.config%s", home_dir, token+10);
+                            else if (strncmp(token, "xdg-data", 8) == 0) snprintf(resolved, PATH_MAX, "%s/.local/share%s", home_dir, token+8);
+                            else if (strncmp(token, "xdg-download", 12) == 0) snprintf(resolved, PATH_MAX, "%s/Downloads%s", home_dir, token+12);
+                            else if (strncmp(token, "~/", 2) == 0) snprintf(resolved, PATH_MAX, "%s/%s", home_dir, token+2);
+                            else strncpy(resolved, token, PATH_MAX - 1);
+
+                            char *suffix = strchr(resolved, ':');
+                            if (suffix) *suffix = '\\0';
+
+                            add_arg("--bind-try"); add_arg(resolved); add_arg(resolved);
                         }}
-                    }}
-                    else if (strstr(key, \"shared\")) {{
-                        if (!strstr(val, \"network\")) add_arg(\"--unshare-net\");
-                        if (!strstr(val, \"ipc\")) add_arg(\"--unshare-ipc\");
-                    }}
-                    else if (strstr(key, \"sockets\")) {{
-                        if (strstr(val, \"wayland\")) {{
-                            char wl_path[PATH_MAX];
-                            snprintf(wl_path, sizeof(wl_path), \"/run/user/%d/%s\", getuid(), getenv(\"WAYLAND_DISPLAY\") ? getenv(\"WAYLAND_DISPLAY\") : \"wayland-0\");
-                            add_arg(\"--ro-bind-try\"); add_arg(wl_path); add_arg(wl_path);
-                        }}
-                        if (strstr(val, \"x11\") || strstr(val, \"fallback-x11\")) {{
-                            add_arg(\"--ro-bind-try\"); add_arg(\"/tmp/.X11-unix\"); add_arg(\"/tmp/.X11-unix\");
-                        }}
-                        if (strstr(val, \"pulseaudio\")) {{
-                            char pa_path[PATH_MAX];
-                            snprintf(pa_path, sizeof(pa_path), \"/run/user/%d/pulse\", getuid());
-                            add_arg(\"--ro-bind-try\"); add_arg(pa_path); add_arg(pa_path);
-                        }}
-                    }}
-                    else if (strstr(key, \"devices\")) {{
-                        if (strstr(val, \"dri\")) {{
-                            add_arg(\"--dev-bind\"); add_arg(\"/dev/dri\"); add_arg(\"/dev/dri\");
-                        }}
+                        token = strtok(NULL, ";");
                     }}
                 }}
-                else if (strcmp(current_section, \"Sysext\") == 0) {{
-                    if (strstr(key, \"nosandbox\") && strstr(val, \"true\")) no_sandbox = 1;
+                else if (strcmp(current_section, "Context") == 0 && strstr(key, "sockets")) {{
+                    if (strstr(val, "wayland")) {{
+                        char wl[PATH_MAX]; snprintf(wl, PATH_MAX, "/run/user/%d/%s", getuid(), getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "wayland-0");
+                        add_arg("--ro-bind-try"); add_arg(wl); add_arg(wl);
+                    }}
+                    if (strstr(val, "x11") || strstr(val, "fallback-x11")) {{ add_arg("--ro-bind-try"); add_arg("/tmp/.X11-unix"); add_arg("/tmp/.X11-unix"); }}
+                    if (strstr(val, "pulseaudio")) {{
+                        char pa[PATH_MAX]; snprintf(pa, PATH_MAX, "/run/user/%d/pulse", getuid());
+                        add_arg("--ro-bind-try"); add_arg(pa); add_arg(pa);
+                    }}
+                }}
+                else if (strcmp(current_section, "Context") == 0 && strstr(key, "devices")) {{
+                    if (strstr(val, "dri")) {{ add_arg("--dev-bind"); add_arg("/dev/dri"); add_arg("/dev/dri"); }}
                 }}
             }}
             fclose(meta_file);
         }}
 
-        add_arg(\"{entrypoint_suffix}\");
+        char entrypoint[PATH_MAX];
+        snprintf(entrypoint, PATH_MAX, "/nyx%s", "{entrypoint_suffix}");
+        add_arg(entrypoint);
+
         for (int i = 1; i < argc; i++) add_arg(argv[i]);
         args[arg_count] = NULL;
 
-        if (no_sandbox) {{
-            execvp(\"{entrypoint_suffix}\", &argv[0]);
-            perror(\"Bypass failed\");
-            return 1;
+        pid_t bwrap_pid = fork();
+        if (bwrap_pid == 0) {{
+            execvp("bwrap", args);
+            perror("NYX FATAL: execvp bwrap failed");
+            exit(1);
         }}
 
-        execvp(\"bwrap\", args);
-        perror(\"Bwrap failed\");
-        return 1;
+        int status;
+        waitpid(bwrap_pid, &status, 0);
+
+        pid_t umount_pid = fork();
+        if (umount_pid == 0) {{
+            execlp("fusermount3", "fusermount3", "-u", "-z", mount_dir, NULL);
+            execlp("fusermount", "fusermount", "-u", "-z", mount_dir, NULL);
+            execlp("umount", "umount", mount_dir, NULL);
+            exit(1);
+        }}
+        waitpid(umount_pid, NULL, 0);
+        rmdir(mount_dir);
+
+        return WEXITSTATUS(status);
     }}
     """
 
     try:
         with open(wrapper_c_path, "w") as f:
-         f.write(c_code)
+            f.write(c_code)
         subprocess.run(["gcc", "-O3", "-s", "-o", wrapper_bin_path, wrapper_c_path], check=True)
         os.remove(wrapper_c_path)
         return wrapper_bin_path
     except Exception as e:
-        logging.error(f"Error generating wrapper: {{e}}")
+        logging.error(f"Error compiling C wrapper: {e}")
         raise
 
 def stitch_app(output_app_path, runtime_path, erofs_path):
