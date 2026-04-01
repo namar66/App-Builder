@@ -136,6 +136,14 @@ def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, ap
     #define MAX_ARGS 2048
 
     int main(int argc, char *argv[]) {{
+        if (argc == 2 && strcmp(argv[1], "--app-version") == 0) {{
+            printf("%s\\n", "{app_version}");
+            return 0;
+        }}
+        if (argc == 2 && strcmp(argv[1], "--app-mode") == 0) {{
+            printf("%s\\n", "{app_mode}");
+            return 0;
+        }}
         char *args[MAX_ARGS];
         int arg_count = 0;
 
@@ -391,6 +399,13 @@ def generate_c_wrapper(source_path, entrypoint_suffix, app_name, app_version, ap
         raise
 
 def stitch_app(output_app_path, runtime_path, erofs_path):
+    # OCHRANA PROTI TEXT FILE BUSY: Smažeme starou verzi, pokud existuje
+    if os.path.exists(output_app_path):
+        try:
+            os.remove(output_app_path)
+        except OSError as e:
+            logging.warning(f"Nemohu smazat existující aplikaci (asi běží), ale zkusím to přepsat: {e}")
+
     with open(output_app_path, "wb") as f_out:
         with open(runtime_path, "rb") as f_runtime:
             f_out.write(f_runtime.read())
